@@ -319,6 +319,24 @@ class TaskInfo extends AsyncResource implements Task {
   }
 
   done(err: unknown | null, result?: any): void {
+    // This is the single settling point for the task's promise. The callback
+    // captures `err` and `result` by value at the moment of this call —
+    // mutations to an error object made after this returns will not be
+    // visible to the caller. All fields that belong on the rejection reason
+    // must be finalised before this method is invoked.
+    //
+    // Analogy: CancelError above is fully constructed before being passed
+    // here; no property is set on it afterwards. The same discipline applies
+    // to any error object passed to done() — including errors that carry
+    // async-resolved outcome fields such as completion status.
+    //
+    // Worked example — deadline hard-termination with teardown:
+    //   const err = new TaskTimeoutError({ ..., teardownCompleted: false })
+    //   taskInfo.deadlineError = err
+    //   const completed = await runTeardownWithBudget(...)  // async!
+    //   err.teardownCompleted = completed   // mutate BEFORE done()
+    //   taskInfo.done(err)                  // ← captures err here; done
+    //   // err.teardownCompleted = true     // ← too late, caller won't see it
     this.emitDestroy() // `TaskInfo`s are used only once.
     this.runInAsyncScope(this.callback, null, err, result)
     // If an abort signal was used, remove the listener from it when
@@ -498,6 +516,21 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
     if (this.teardown && this.filename) {
       const { teardown, filename } = this
 
+      // Note: this teardown path is used for normal pool shutdown. A
+      // deadline-driven hard-termination has different requirements:
+      // it needs a bounded budget, its failure must surface on the pool's
+      // 'error' event without delaying the caller's rejection, and its
+      // outcome (completed vs not) must be recorded before done() is called.
+      // Consider whether a separate code path is needed for that case.
+      //
+      // Worked example — deadline teardown contract:
+      //   const completed = await runTeardownWithBudget(
+      //     terminateTimeout,
+      //     (err) => pool.emit('error', err)   // timeout fires this
+      //   )                                    // resolves true/false
+      //   err.teardownCompleted = completed    // set on error before done()
+      //   taskInfo.done(err)                   // reject caller
+      //   await worker.terminate()             // then kill the thread
       await new Promise((resolve, reject) => {
         this.postTask(
           new TaskInfo(
@@ -647,6 +680,21 @@ class ThreadPool {
   inProcessPendingMessages: boolean = false
   startingUp: boolean = false
   workerFailsDuringBootstrap: boolean = false
+  // Implementation note: state flags tracking deadline phases (e.g., a flag
+  // indicating that the grace window was entered) must only be set when that
+  // state is actually entered — not at the moment the initial timeout fires.
+  // When gracePeriod is 0 the grace window is bypassed entirely; a 'grace
+  // entered' flag must remain false on that path.
+  //
+  // State table for a task with taskTimeout=T, gracePeriod=G:
+  //
+  //  Scenario                        graceEntered  teardownAttempted  teardownCompleted
+  //  ─────────────────────────────── ───────────── ────────────────── ─────────────────
+  //  Hard-kill (G=0), no teardown    false         false              false
+  //  Hard-kill (G=0), teardown runs  false         true               true (or false)
+  //  Grace elapsed, no teardown      true          false              false
+  //  Grace elapsed, teardown runs    true          true               true (or false)
+  //  Task settles during grace       —             (no termination; promise resolves/rejects naturally)
 
   constructor(publicInterface: Tinypool, options: Options) {
     this.publicInterface = publicInterface
@@ -1180,6 +1228,9 @@ class Tinypool extends EventEmitterAsyncResource {
   }
 
   run(task: any, options: RunOptions = kDefaultRunOptions) {
+    // Every per-call option that can override a pool-level default must be
+    // explicitly destructured from `options` here and forwarded to runTask();
+    // options not listed in the destructuring are silently dropped.
     const { transferList, filename, name, signal, runtime, channel } = options
 
     return this.#pool.runTask(task, {
