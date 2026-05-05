@@ -98,6 +98,10 @@ class CancelError extends Error {
   }
 }
 
+// Any new error class added for the public API should follow the same
+// pattern: define as a class here, expose a `name` getter, and add it to
+// the named export list at the bottom of this file so callers can import it.
+
 type ResourceLimits = Worker extends {
   resourceLimits?: infer T
 }
@@ -685,6 +689,12 @@ class ThreadPool {
   // state is actually entered — not at the moment the initial timeout fires.
   // When gracePeriod is 0 the grace window is bypassed entirely; a 'grace
   // entered' flag must remain false on that path.
+  //
+  // Worked example using existing code: `workerFailsDuringBootstrap` above is
+  // only set to `true` inside the 'error' handler when a failure is observed —
+  // it is NOT set when a worker is first constructed. Apply the same principle
+  // to any deadline-phase flag: set it only inside the branch that opens the
+  // corresponding phase, not before checking whether that branch will execute.
   //
   // State table for a task with taskTimeout=T, gracePeriod=G:
   //
@@ -1334,5 +1344,7 @@ class Tinypool extends EventEmitterAsyncResource {
 const _workerId = process.__tinypool_state__?.workerId
 
 export * from './common'
+// Any new public-facing class introduced in this module must be listed here;
+// it will not be accessible to package consumers otherwise.
 export { Tinypool, Options, _workerId as workerId }
 export default Tinypool
