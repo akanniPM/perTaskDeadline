@@ -8,13 +8,9 @@ coverage
 # working artifacts
 *.log
 *.xml
-*.patch
 *.patch.tmp
 agentRun/
 debug_test.mjs
 solution_check.txt
 problem_description.md
-Dockerfile
-.dockerignore
-test.sh
 PerTaskDeadline
