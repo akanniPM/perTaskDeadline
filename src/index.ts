@@ -102,35 +102,6 @@ class CancelError extends Error {
 // pattern: define as a class here, expose a `name` getter, and add it to
 // the named export list at the bottom of this file so callers can import it.
 
-interface TaskTimeoutErrorOptions {
-  taskTimeout: number
-  gracePeriod: number
-  graceEntered: boolean
-  teardownAttempted: boolean
-  teardownCompleted: boolean
-}
-
-class TaskTimeoutError extends Error {
-  taskTimeout: number
-  gracePeriod: number
-  graceEntered: boolean
-  teardownAttempted: boolean
-  teardownCompleted: boolean
-
-  constructor(options: TaskTimeoutErrorOptions) {
-    super(`Task timed out after ${options.taskTimeout}ms`)
-    this.taskTimeout = options.taskTimeout
-    this.gracePeriod = options.gracePeriod
-    this.graceEntered = options.graceEntered
-    this.teardownAttempted = options.teardownAttempted
-    this.teardownCompleted = options.teardownCompleted
-  }
-
-  get name() {
-    return 'TaskTimeoutError'
-  }
-}
-
 type ResourceLimits = Worker extends {
   resourceLimits?: infer T
 }
@@ -188,8 +159,6 @@ interface Options {
   isolateWorkers?: boolean
   teardown?: string
   serialization?: SerializationType
-  taskTimeout?: number
-  gracePeriod?: number
 }
 
 interface FilledOptions extends Options {
@@ -226,8 +195,6 @@ interface RunOptions {
   signal?: AbortSignalAny | null
   name?: string | null
   runtime?: Options['runtime']
-  taskTimeout?: number
-  gracePeriod?: number
 }
 
 interface FilledRunOptions extends RunOptions {
@@ -309,11 +276,6 @@ class TaskInfo extends AsyncResource implements Task {
   created: number
   started: number
   cancel: () => void
-  taskTimeout: number | undefined
-  gracePeriod: number | undefined
-  deadlineTimer: NodeJS.Timeout | null = null
-  graceTimer: NodeJS.Timeout | null = null
-  pendingDeadlineError: TaskTimeoutError | null = null
 
   constructor(
     task: any,
@@ -323,9 +285,7 @@ class TaskInfo extends AsyncResource implements Task {
     callback: TaskCallback,
     abortSignal: AbortSignalAny | null,
     triggerAsyncId: number,
-    channel?: TinypoolChannel,
-    taskTimeout?: number,
-    gracePeriod?: number
+    channel?: TinypoolChannel
   ) {
     super('Tinypool.Task', { requireManualDestroy: true, triggerAsyncId })
     this.callback = callback
@@ -333,8 +293,6 @@ class TaskInfo extends AsyncResource implements Task {
     this.transferList = transferList
     this.cancel = () => this.callback(new CancelError(), null)
     this.channel = channel
-    this.taskTimeout = taskTimeout
-    this.gracePeriod = gracePeriod
 
     // If the task is a Transferable returned by
     // Tinypool.move(), then add it to the transferList
@@ -608,7 +566,7 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
       this.port.close()
       this.clearIdleTimeout()
       for (const taskInfo of this.taskInfos.values()) {
-        taskInfo.done(taskInfo.pendingDeadlineError ?? Errors.ThreadTermination())
+        taskInfo.done(Errors.ThreadTermination())
       }
       this.taskInfos.clear()
 
@@ -722,8 +680,6 @@ class ThreadPool {
   taskQueue: TaskQueue
   skipQueue: TaskInfo[] = []
   completed: number = 0
-  taskTimeoutCount: number = 0
-  taskTimeoutTerminationCount: number = 0
   start: number = performance.now()
   inProcessPendingMessages: boolean = false
   startingUp: boolean = false
@@ -997,7 +953,6 @@ class ThreadPool {
       const now = performance.now()
       taskInfo.started = now
       workerInfo.postTask(taskInfo)
-      this._armDeadline(taskInfo, workerInfo)
       this._maybeDrain()
       return
     }
@@ -1016,11 +971,6 @@ class ThreadPool {
   }
 
   runTask(task: any, options: RunOptions): Promise<any> {
-    const resolvedTaskTimeout =
-      'taskTimeout' in options ? options.taskTimeout : this.options.taskTimeout
-    const resolvedGracePeriod =
-      'gracePeriod' in options ? options.gracePeriod : this.options.gracePeriod
-
     let { filename, name } = options
     const { transferList = [], signal = null, channel } = options
 
@@ -1065,9 +1015,7 @@ class ThreadPool {
       },
       signal,
       this.publicInterface.asyncResource.asyncId(),
-      channel,
-      resolvedTaskTimeout,
-      resolvedGracePeriod
+      channel
     )
 
     if (signal !== null) {
@@ -1148,7 +1096,6 @@ class ThreadPool {
     const now = performance.now()
     taskInfo.started = now
     workerInfo.postTask(taskInfo)
-    this._armDeadline(taskInfo, workerInfo)
     this._maybeDrain()
 
     return ret
@@ -1188,149 +1135,6 @@ class ThreadPool {
     if (this.taskQueue.size === 0 && this.skipQueue.length === 0) {
       this.publicInterface.emit('drain')
     }
-  }
-
-  _armDeadline(taskInfo: TaskInfo, workerInfo: WorkerInfo): void {
-    const timeout = taskInfo.taskTimeout
-    if (timeout == null || !Number.isFinite(timeout) || timeout <= 0) return
-
-    const rawGrace = taskInfo.gracePeriod ?? 0
-    const normGrace = Number.isFinite(rawGrace) && rawGrace > 0 ? rawGrace : 0
-
-    taskInfo.deadlineTimer = setTimeout(() => {
-      taskInfo.deadlineTimer = null
-      if (!workerInfo.taskInfos.has(taskInfo.taskId)) return
-
-      this.taskTimeoutCount++
-      this.publicInterface.emit('taskTimeout', {
-        taskId: taskInfo.taskId,
-        workerId: workerInfo.workerId,
-        taskTimeout: timeout,
-        gracePeriod: rawGrace,
-      })
-
-      if (normGrace <= 0) {
-        void this._hardTerminate(taskInfo, workerInfo, timeout, rawGrace, false)
-        return
-      }
-
-      taskInfo.pendingDeadlineError = new TaskTimeoutError({
-        taskTimeout: timeout,
-        gracePeriod: normGrace,
-        graceEntered: true,
-        teardownAttempted: false,
-        teardownCompleted: false,
-      })
-
-      taskInfo.graceTimer = setTimeout(() => {
-        taskInfo.graceTimer = null
-        if (!workerInfo.taskInfos.has(taskInfo.taskId)) return
-        void this._hardTerminate(taskInfo, workerInfo, timeout, normGrace, true)
-      }, normGrace).unref()
-    }, timeout).unref()
-  }
-
-  async _hardTerminate(
-    taskInfo: TaskInfo,
-    workerInfo: WorkerInfo,
-    taskTimeout: number,
-    gracePeriod: number,
-    graceEntered: boolean
-  ): Promise<void> {
-    if (taskInfo.deadlineTimer !== null) {
-      clearTimeout(taskInfo.deadlineTimer)
-      taskInfo.deadlineTimer = null
-    }
-    if (taskInfo.graceTimer !== null) {
-      clearTimeout(taskInfo.graceTimer)
-      taskInfo.graceTimer = null
-    }
-
-    workerInfo.freeWorkerId()
-    this.workers.delete(workerInfo)
-
-    workerInfo.taskInfos.delete(taskInfo.taskId)
-
-    const siblings = [...workerInfo.taskInfos.values()]
-    workerInfo.taskInfos.clear()
-
-    this.taskTimeoutTerminationCount++
-
-    let teardownAttempted = false
-    let teardownCompleted = false
-    const terminateTimeout = this.options.terminateTimeout
-
-    if (workerInfo.teardown && workerInfo.filename) {
-      teardownAttempted = true
-      const { teardown, filename } = workerInfo
-
-      const teardownPromise = new Promise<void>((res, rej) => {
-        try {
-          workerInfo.postTask(
-            new TaskInfo(
-              {},
-              [],
-              filename,
-              teardown,
-              (err) => (err ? rej(err) : res()),
-              null,
-              1,
-              undefined
-            )
-          )
-        } catch (e) {
-          rej(e)
-        }
-      })
-
-      try {
-        if (terminateTimeout != null && terminateTimeout > 0) {
-          await Promise.race([
-            teardownPromise,
-            new Promise<never>((_, rej) =>
-              setTimeout(
-                () => rej(new Error('Teardown timed out')),
-                terminateTimeout
-              ).unref()
-            ),
-          ])
-        } else {
-          await teardownPromise
-        }
-        teardownCompleted = true
-      } catch (err) {
-        this.publicInterface.emit('error', err)
-      }
-    }
-
-    this.publicInterface.emit('taskTimeoutTermination', {
-      taskId: taskInfo.taskId,
-      workerId: workerInfo.workerId,
-      taskTimeout,
-      gracePeriod,
-      teardownAttempted,
-    })
-
-    const deadlineErr = new TaskTimeoutError({
-      taskTimeout,
-      gracePeriod,
-      graceEntered,
-      teardownAttempted,
-      teardownCompleted,
-    })
-
-    taskInfo.done(deadlineErr)
-
-    for (const sibling of siblings) {
-      sibling.done(Errors.ThreadTermination())
-    }
-
-    void workerInfo.worker.terminate().then(() => {
-      workerInfo.port.close()
-      workerInfo.clearIdleTimeout()
-    })
-
-    this._ensureMinimumWorkers()
   }
 
   async destroy() {
@@ -1438,21 +1242,15 @@ class Tinypool extends EventEmitterAsyncResource {
     // explicitly destructured from `options` here and forwarded to runTask();
     // options not listed in the destructuring are silently dropped.
     const { transferList, filename, name, signal, runtime, channel } = options
-    const perCallOpts: RunOptions = {
+
+    return this.#pool.runTask(task, {
       transferList,
       filename,
       name,
       signal,
       runtime,
       channel,
-    }
-    if ('taskTimeout' in options) {
-      perCallOpts.taskTimeout = options.taskTimeout
-    }
-    if ('gracePeriod' in options) {
-      perCallOpts.gracePeriod = options.gracePeriod
-    }
-    return this.#pool.runTask(task, perCallOpts)
+    })
   }
 
   async destroy() {
@@ -1488,14 +1286,6 @@ class Tinypool extends EventEmitterAsyncResource {
 
   get completed(): number {
     return this.#pool.completed
-  }
-
-  get taskTimeoutCount(): number {
-    return this.#pool.taskTimeoutCount
-  }
-
-  get taskTimeoutTerminationCount(): number {
-    return this.#pool.taskTimeoutTerminationCount
   }
 
   get duration(): number {
@@ -1556,5 +1346,5 @@ const _workerId = process.__tinypool_state__?.workerId
 export * from './common'
 // Any new public-facing class introduced in this module must be listed here;
 // it will not be accessible to package consumers otherwise.
-export { Tinypool, Options, _workerId as workerId, TaskTimeoutError }
+export { Tinypool, Options, _workerId as workerId }
 export default Tinypool

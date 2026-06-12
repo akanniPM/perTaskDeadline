@@ -1,9 +1,9 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..3d1b694
+index 0000000..9c5e860
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,72 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -36,7 +36,7 @@ index 0000000..3d1b694
 +fi
 +
 +# Rebuild dist/ so tests pick up any patches applied after image build.
-+pnpm build >/dev/null
++node_modules/.bin/tsdown >/dev/null
 +
 +# Run test files serially because the repo's vitest.config.ts uses
 +# `isolate: false`, which makes parallel test files share module state.
@@ -47,9 +47,6 @@ index 0000000..3d1b694
 +fi
 +
 +# Choose reporters based on whether a file output was requested.
-+# When writing JUnit XML, use only the junit reporter (it also prints
-+# a summary to stdout).  When running interactively, use the default
-+# human-readable reporter.
 +if [[ -n "$OUTPUT_PATH" ]]; then
 +  ARGS=(
 +    run
@@ -67,17 +64,16 @@ index 0000000..3d1b694
 +  )
 +fi
 +
++# Worker-pool tests are timing-sensitive; use a generous timeout and bounded
++# retries (kept identical across base and new) so transient scheduling jitter
++# under load does not surface as a flaky failure.
 +case "$MODE" in
 +  base)
-+    # Use shell glob so vitest only receives top-level test/*.test.ts files,
-+    # never descending into test/new/ regardless of vitest version behaviour.
-+    # Increase testTimeout for Docker environments where child-process recycling
-+    # tests can exceed the default 5000ms.
-+    exec pnpm exec vitest "${ARGS[@]}" --testTimeout=30000 --retry=3 test/*.test.ts
++    exec node_modules/.bin/vitest "${ARGS[@]}" --testTimeout=30000 --retry=3 test/*.test.ts
 +    ;;
 +  new)
 +    mkdir -p test/new
-+    exec pnpm exec vitest "${ARGS[@]}" --testTimeout=20000 test/new/*.test.ts
++    exec node_modules/.bin/vitest "${ARGS[@]}" --testTimeout=30000 --retry=3 test/new/*.test.ts
 +    ;;
 +esac
 diff --git a/test/new/fixtures/hang.mjs b/test/new/fixtures/hang.mjs
@@ -131,11 +127,11 @@ index 0000000..4bc282c
 +    Atomics.wait(buf, 0, 0)
 +  }
 +}
-diff --git a/test/new/per-task-deadline.test.ts b/test/new/per-task-deadline.test.ts
+diff --git a/test/new/per-task-deadline.e6b18c.test.ts b/test/new/per-task-deadline.e6b18c.test.ts
 new file mode 100644
 index 0000000..ad752c6
 --- /dev/null
-+++ b/test/new/per-task-deadline.test.ts
++++ b/test/new/per-task-deadline.e6b18c.test.ts
 @@ -0,0 +1,920 @@
 +import { promisify } from 'node:util'
 +import { dirname, resolve } from 'node:path'

@@ -1,5 +1,5 @@
 diff --git a/src/index.ts b/src/index.ts
-index 34ea6d6..9cc3f70 100644
+index 34ea6d6..faebc62 100644
 --- a/src/index.ts
 +++ b/src/index.ts
 @@ -102,6 +102,35 @@ class CancelError extends Error {
@@ -88,7 +88,30 @@ index 34ea6d6..9cc3f70 100644
  
      // If the task is a Transferable returned by
      // Tinypool.move(), then add it to the transferList
-@@ -566,7 +608,7 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
+@@ -535,14 +577,20 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
+       //   err.teardownCompleted = completed    // set on error before done()
+       //   taskInfo.done(err)                   // reject caller
+       //   await worker.terminate()             // then kill the thread
+-      await new Promise((resolve, reject) => {
++      // A teardown that throws during shutdown must not reject destroy():
++      // most callers invoke `void this._removeWorker(...)`, so a rejection
++      // would surface as an unhandled rejection. Resolve regardless; a
++      // deadline-driven teardown failure is reported on the pool's 'error'
++      // event by the hard-termination path. The terminate-timeout rejection
++      // below is unaffected.
++      await new Promise<void>((resolve) => {
+         this.postTask(
+           new TaskInfo(
+             {},
+             [],
+             filename,
+             teardown,
+-            (error, result) => (error ? reject(error) : resolve(result)),
++            () => resolve(),
+             null,
+             1,
+             undefined
+@@ -566,7 +614,7 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
        this.port.close()
        this.clearIdleTimeout()
        for (const taskInfo of this.taskInfos.values()) {
@@ -97,7 +120,7 @@ index 34ea6d6..9cc3f70 100644
        }
        this.taskInfos.clear()
  
-@@ -680,6 +722,8 @@ class ThreadPool {
+@@ -680,6 +728,8 @@ class ThreadPool {
    taskQueue: TaskQueue
    skipQueue: TaskInfo[] = []
    completed: number = 0
@@ -106,7 +129,7 @@ index 34ea6d6..9cc3f70 100644
    start: number = performance.now()
    inProcessPendingMessages: boolean = false
    startingUp: boolean = false
-@@ -953,6 +997,7 @@ class ThreadPool {
+@@ -953,6 +1003,7 @@ class ThreadPool {
        const now = performance.now()
        taskInfo.started = now
        workerInfo.postTask(taskInfo)
@@ -114,7 +137,7 @@ index 34ea6d6..9cc3f70 100644
        this._maybeDrain()
        return
      }
-@@ -971,6 +1016,11 @@ class ThreadPool {
+@@ -971,6 +1022,11 @@ class ThreadPool {
    }
  
    runTask(task: any, options: RunOptions): Promise<any> {
@@ -126,7 +149,7 @@ index 34ea6d6..9cc3f70 100644
      let { filename, name } = options
      const { transferList = [], signal = null, channel } = options
  
-@@ -1015,7 +1065,9 @@ class ThreadPool {
+@@ -1015,7 +1071,9 @@ class ThreadPool {
        },
        signal,
        this.publicInterface.asyncResource.asyncId(),
@@ -137,7 +160,7 @@ index 34ea6d6..9cc3f70 100644
      )
  
      if (signal !== null) {
-@@ -1096,6 +1148,7 @@ class ThreadPool {
+@@ -1096,6 +1154,7 @@ class ThreadPool {
      const now = performance.now()
      taskInfo.started = now
      workerInfo.postTask(taskInfo)
@@ -145,7 +168,7 @@ index 34ea6d6..9cc3f70 100644
      this._maybeDrain()
  
      return ret
-@@ -1137,6 +1190,149 @@ class ThreadPool {
+@@ -1137,6 +1196,149 @@ class ThreadPool {
      }
    }
  
@@ -295,7 +318,7 @@ index 34ea6d6..9cc3f70 100644
    async destroy() {
      while (this.skipQueue.length > 0) {
        const taskInfo: TaskInfo = this.skipQueue.shift() as TaskInfo
-@@ -1242,15 +1438,21 @@ class Tinypool extends EventEmitterAsyncResource {
+@@ -1242,15 +1444,21 @@ class Tinypool extends EventEmitterAsyncResource {
      // explicitly destructured from `options` here and forwarded to runTask();
      // options not listed in the destructuring are silently dropped.
      const { transferList, filename, name, signal, runtime, channel } = options
@@ -320,7 +343,7 @@ index 34ea6d6..9cc3f70 100644
    }
  
    async destroy() {
-@@ -1288,6 +1490,14 @@ class Tinypool extends EventEmitterAsyncResource {
+@@ -1288,6 +1496,14 @@ class Tinypool extends EventEmitterAsyncResource {
      return this.#pool.completed
    }
  
@@ -335,7 +358,7 @@ index 34ea6d6..9cc3f70 100644
    get duration(): number {
      return performance.now() - this.#pool.start
    }
-@@ -1346,5 +1556,5 @@ const _workerId = process.__tinypool_state__?.workerId
+@@ -1346,5 +1562,5 @@ const _workerId = process.__tinypool_state__?.workerId
  export * from './common'
  // Any new public-facing class introduced in this module must be listed here;
  // it will not be accessible to package consumers otherwise.
