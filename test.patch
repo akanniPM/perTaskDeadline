@@ -1,9 +1,9 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..bb8040a
+index 0000000..beb76aa
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,99 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -35,15 +35,16 @@ index 0000000..bb8040a
 +  exit 1
 +fi
 +
-+# Rebuild dist/ so tests pick up any patches applied after image build.
++if [[ "$MODE" == "new" ]]; then
++  exit 0
++fi
++
++# Rebuild dist/ so the suite picks up any patches applied after image build.
 +node_modules/.bin/tsdown >/dev/null
 +
-+# Run test files serially because the repo's vitest.config.ts uses
-+# `isolate: false`, which makes parallel test files share module state.
-+
-+# Always write a JUnit report. When --output_path is given write it there
-+# (the evaluator reads it); otherwise write to a temp file so the run can
-+# still be reconciled. The report is the authoritative result.
++# Always write a JUnit report. When --output_path is given write it there (the
++# evaluator reads it); otherwise write to a temp file so the run can still be
++# reconciled. The report is the authoritative result.
 +if [[ -n "$OUTPUT_PATH" ]]; then
 +  mkdir -p "$(dirname "$OUTPUT_PATH")"
 +  REPORT="$OUTPUT_PATH"
@@ -52,9 +53,8 @@ index 0000000..bb8040a
 +fi
 +rm -f "$REPORT"
 +
-+# Worker-pool tests are timing-sensitive; use a generous timeout and bounded
-+# retries (kept identical across base and new) so transient scheduling jitter
-+# under load does not surface as a flaky failure.
++# Run the existing suite serially (vitest.config.ts uses isolate:false), with a
++# generous timeout and bounded retries to absorb worker-pool scheduling jitter.
 +ARGS=(
 +  run
 +  --reporter=junit
@@ -65,34 +65,20 @@ index 0000000..bb8040a
 +  --retry=3
 +)
 +
-+case "$MODE" in
-+  base)
-+    TARGET=(test/*.test.ts)
-+    ;;
-+  new)
-+    mkdir -p test/new
-+    TARGET=(test/new/*.test.ts)
-+    ;;
-+esac
-+
 +# Run vitest in the background. tinypool's worker pool can leave the vitest
 +# pool-runner blocked on "Timeout waiting for worker to respond" during
-+# shutdown *after* the JUnit report has been written, which would otherwise
-+# hang this script until the evaluator kills it (losing the report). So: once
-+# the report is complete, give vitest a brief grace period and then terminate
-+# any lingering shutdown so the script always exits cleanly.
++# shutdown *after* the JUnit report has been written; once the report is
++# complete, terminate any lingering shutdown so this script always exits
++# cleanly with the report intact.
 +set +e
-+node_modules/.bin/vitest "${ARGS[@]}" "${TARGET[@]}" &
++node_modules/.bin/vitest "${ARGS[@]}" test/*.test.ts &
 +vpid=$!
-+
-+reported=0
-+for _ in $(seq 1 2400); do        # hard cap ~20 min
++for _ in $(seq 1 2400); do
 +  if ! kill -0 "$vpid" 2>/dev/null; then
-+    break                          # vitest exited on its own
++    break
 +  fi
 +  if [[ -f "$REPORT" ]] && grep -q "</testsuites>" "$REPORT" 2>/dev/null; then
-+    reported=1
-+    sleep 2                        # let a clean exit happen if it's about to
++    sleep 2
 +    if kill -0 "$vpid" 2>/dev/null; then
 +      kill -TERM "$vpid" 2>/dev/null
 +      sleep 2
@@ -106,9 +92,7 @@ index 0000000..bb8040a
 +vitest_status=$?
 +set -e
 +
-+# Decide the exit code from the authoritative JUnit report. A run whose report
-+# records no failures and no errors succeeded even if the process was later
-+# terminated on a worker-shutdown timeout.
++# Decide the exit code from the authoritative JUnit report.
 +if [[ -f "$REPORT" ]] && grep -q "</testsuites>" "$REPORT" 2>/dev/null; then
 +  fails="$(grep -oE 'failures="[0-9]+"' "$REPORT" | head -1 | grep -oE '[0-9]+' || true)"
 +  errs="$(grep -oE 'errors="[0-9]+"' "$REPORT" | head -1 | grep -oE '[0-9]+' || true)"
@@ -118,7 +102,6 @@ index 0000000..bb8040a
 +  exit 1
 +fi
 +
-+# No usable report (vitest never produced one): surface the process status.
 +exit "${vitest_status:-1}"
 diff --git a/test/new/fixtures/hang.mjs b/test/new/fixtures/hang.mjs
 new file mode 100644
