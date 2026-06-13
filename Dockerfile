@@ -21,6 +21,7 @@ RUN pnpm install --frozen-lockfile --prefer-offline --prod=false
 
 COPY . .
 
+
 # Provide a non-root user/group at uid/gid 1000 (idempotent: the base image may
 # already define one).
 RUN if ! getent group 1000 >/dev/null 2>&1; then groupadd -g 1000 model; fi \

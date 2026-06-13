@@ -1,11 +1,15 @@
 diff --git a/src/index.ts b/src/index.ts
-index 34ea6d6..faebc62 100644
+index 883c89a..faebc62 100644
 --- a/src/index.ts
 +++ b/src/index.ts
-@@ -102,6 +102,35 @@ class CancelError extends Error {
- // pattern: define as a class here, expose a `name` getter, and add it to
- // the named export list at the bottom of this file so callers can import it.
+@@ -98,6 +98,39 @@ class CancelError extends Error {
+   }
+ }
  
++// Any new error class added for the public API should follow the same
++// pattern: define as a class here, expose a `name` getter, and add it to
++// the named export list at the bottom of this file so callers can import it.
++
 +interface TaskTimeoutErrorOptions {
 +  taskTimeout: number
 +  gracePeriod: number
@@ -38,7 +42,7 @@ index 34ea6d6..faebc62 100644
  type ResourceLimits = Worker extends {
    resourceLimits?: infer T
  }
-@@ -159,6 +188,8 @@ interface Options {
+@@ -155,6 +188,8 @@ interface Options {
    isolateWorkers?: boolean
    teardown?: string
    serialization?: SerializationType
@@ -47,7 +51,7 @@ index 34ea6d6..faebc62 100644
  }
  
  interface FilledOptions extends Options {
-@@ -195,6 +226,8 @@ interface RunOptions {
+@@ -191,6 +226,8 @@ interface RunOptions {
    signal?: AbortSignalAny | null
    name?: string | null
    runtime?: Options['runtime']
@@ -56,7 +60,7 @@ index 34ea6d6..faebc62 100644
  }
  
  interface FilledRunOptions extends RunOptions {
-@@ -276,6 +309,11 @@ class TaskInfo extends AsyncResource implements Task {
+@@ -272,6 +309,11 @@ class TaskInfo extends AsyncResource implements Task {
    created: number
    started: number
    cancel: () => void
@@ -68,7 +72,7 @@ index 34ea6d6..faebc62 100644
  
    constructor(
      task: any,
-@@ -285,7 +323,9 @@ class TaskInfo extends AsyncResource implements Task {
+@@ -281,7 +323,9 @@ class TaskInfo extends AsyncResource implements Task {
      callback: TaskCallback,
      abortSignal: AbortSignalAny | null,
      triggerAsyncId: number,
@@ -79,7 +83,7 @@ index 34ea6d6..faebc62 100644
    ) {
      super('Tinypool.Task', { requireManualDestroy: true, triggerAsyncId })
      this.callback = callback
-@@ -293,6 +333,8 @@ class TaskInfo extends AsyncResource implements Task {
+@@ -289,6 +333,8 @@ class TaskInfo extends AsyncResource implements Task {
      this.transferList = transferList
      this.cancel = () => this.callback(new CancelError(), null)
      this.channel = channel
@@ -88,11 +92,51 @@ index 34ea6d6..faebc62 100644
  
      // If the task is a Transferable returned by
      // Tinypool.move(), then add it to the transferList
-@@ -535,14 +577,20 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
-       //   err.teardownCompleted = completed    // set on error before done()
-       //   taskInfo.done(err)                   // reject caller
-       //   await worker.terminate()             // then kill the thread
+@@ -319,6 +365,24 @@ class TaskInfo extends AsyncResource implements Task {
+   }
+ 
+   done(err: unknown | null, result?: any): void {
++    // This is the single settling point for the task's promise. The callback
++    // captures `err` and `result` by value at the moment of this call —
++    // mutations to an error object made after this returns will not be
++    // visible to the caller. All fields that belong on the rejection reason
++    // must be finalised before this method is invoked.
++    //
++    // Analogy: CancelError above is fully constructed before being passed
++    // here; no property is set on it afterwards. The same discipline applies
++    // to any error object passed to done() — including errors that carry
++    // async-resolved outcome fields such as completion status.
++    //
++    // Worked example — deadline hard-termination with teardown:
++    //   const err = new TaskTimeoutError({ ..., teardownCompleted: false })
++    //   taskInfo.deadlineError = err
++    //   const completed = await runTeardownWithBudget(...)  // async!
++    //   err.teardownCompleted = completed   // mutate BEFORE done()
++    //   taskInfo.done(err)                  // ← captures err here; done
++    //   // err.teardownCompleted = true     // ← too late, caller won't see it
+     this.emitDestroy() // `TaskInfo`s are used only once.
+     this.runInAsyncScope(this.callback, null, err, result)
+     // If an abort signal was used, remove the listener from it when
+@@ -498,14 +562,35 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
+     if (this.teardown && this.filename) {
+       const { teardown, filename } = this
+ 
 -      await new Promise((resolve, reject) => {
++      // Note: this teardown path is used for normal pool shutdown. A
++      // deadline-driven hard-termination has different requirements:
++      // it needs a bounded budget, its failure must surface on the pool's
++      // 'error' event without delaying the caller's rejection, and its
++      // outcome (completed vs not) must be recorded before done() is called.
++      // Consider whether a separate code path is needed for that case.
++      //
++      // Worked example — deadline teardown contract:
++      //   const completed = await runTeardownWithBudget(
++      //     terminateTimeout,
++      //     (err) => pool.emit('error', err)   // timeout fires this
++      //   )                                    // resolves true/false
++      //   err.teardownCompleted = completed    // set on error before done()
++      //   taskInfo.done(err)                   // reject caller
++      //   await worker.terminate()             // then kill the thread
 +      // A teardown that throws during shutdown must not reject destroy():
 +      // most callers invoke `void this._removeWorker(...)`, so a rejection
 +      // would surface as an unhandled rejection. Resolve regardless; a
@@ -111,7 +155,7 @@ index 34ea6d6..faebc62 100644
              null,
              1,
              undefined
-@@ -566,7 +614,7 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
+@@ -529,7 +614,7 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
        this.port.close()
        this.clearIdleTimeout()
        for (const taskInfo of this.taskInfos.values()) {
@@ -120,7 +164,7 @@ index 34ea6d6..faebc62 100644
        }
        this.taskInfos.clear()
  
-@@ -680,6 +728,8 @@ class ThreadPool {
+@@ -643,10 +728,33 @@ class ThreadPool {
    taskQueue: TaskQueue
    skipQueue: TaskInfo[] = []
    completed: number = 0
@@ -129,7 +173,32 @@ index 34ea6d6..faebc62 100644
    start: number = performance.now()
    inProcessPendingMessages: boolean = false
    startingUp: boolean = false
-@@ -953,6 +1003,7 @@ class ThreadPool {
+   workerFailsDuringBootstrap: boolean = false
++  // Implementation note: state flags tracking deadline phases (e.g., a flag
++  // indicating that the grace window was entered) must only be set when that
++  // state is actually entered — not at the moment the initial timeout fires.
++  // When gracePeriod is 0 the grace window is bypassed entirely; a 'grace
++  // entered' flag must remain false on that path.
++  //
++  // Worked example using existing code: `workerFailsDuringBootstrap` above is
++  // only set to `true` inside the 'error' handler when a failure is observed —
++  // it is NOT set when a worker is first constructed. Apply the same principle
++  // to any deadline-phase flag: set it only inside the branch that opens the
++  // corresponding phase, not before checking whether that branch will execute.
++  //
++  // State table for a task with taskTimeout=T, gracePeriod=G:
++  //
++  //  Scenario                        graceEntered  teardownAttempted  teardownCompleted
++  //  ─────────────────────────────── ───────────── ────────────────── ─────────────────
++  //  Hard-kill (G=0), no teardown    false         false              false
++  //  Hard-kill (G=0), teardown runs  false         true               true (or false)
++  //  Grace elapsed, no teardown      true          false              false
++  //  Grace elapsed, teardown runs    true          true               true (or false)
++  //  Task settles during grace       —             (no termination; promise resolves/rejects naturally)
+ 
+   constructor(publicInterface: Tinypool, options: Options) {
+     this.publicInterface = publicInterface
+@@ -895,6 +1003,7 @@ class ThreadPool {
        const now = performance.now()
        taskInfo.started = now
        workerInfo.postTask(taskInfo)
@@ -137,7 +206,7 @@ index 34ea6d6..faebc62 100644
        this._maybeDrain()
        return
      }
-@@ -971,6 +1022,11 @@ class ThreadPool {
+@@ -913,6 +1022,11 @@ class ThreadPool {
    }
  
    runTask(task: any, options: RunOptions): Promise<any> {
@@ -149,7 +218,7 @@ index 34ea6d6..faebc62 100644
      let { filename, name } = options
      const { transferList = [], signal = null, channel } = options
  
-@@ -1015,7 +1071,9 @@ class ThreadPool {
+@@ -957,7 +1071,9 @@ class ThreadPool {
        },
        signal,
        this.publicInterface.asyncResource.asyncId(),
@@ -160,7 +229,7 @@ index 34ea6d6..faebc62 100644
      )
  
      if (signal !== null) {
-@@ -1096,6 +1154,7 @@ class ThreadPool {
+@@ -1038,6 +1154,7 @@ class ThreadPool {
      const now = performance.now()
      taskInfo.started = now
      workerInfo.postTask(taskInfo)
@@ -168,7 +237,7 @@ index 34ea6d6..faebc62 100644
      this._maybeDrain()
  
      return ret
-@@ -1137,6 +1196,149 @@ class ThreadPool {
+@@ -1079,6 +1196,149 @@ class ThreadPool {
      }
    }
  
@@ -318,9 +387,13 @@ index 34ea6d6..faebc62 100644
    async destroy() {
      while (this.skipQueue.length > 0) {
        const taskInfo: TaskInfo = this.skipQueue.shift() as TaskInfo
-@@ -1242,15 +1444,21 @@ class Tinypool extends EventEmitterAsyncResource {
-     // explicitly destructured from `options` here and forwarded to runTask();
-     // options not listed in the destructuring are silently dropped.
+@@ -1180,16 +1440,25 @@ class Tinypool extends EventEmitterAsyncResource {
+   }
+ 
+   run(task: any, options: RunOptions = kDefaultRunOptions) {
++    // Every per-call option that can override a pool-level default must be
++    // explicitly destructured from `options` here and forwarded to runTask();
++    // options not listed in the destructuring are silently dropped.
      const { transferList, filename, name, signal, runtime, channel } = options
 -
 -    return this.#pool.runTask(task, {
@@ -343,7 +416,7 @@ index 34ea6d6..faebc62 100644
    }
  
    async destroy() {
-@@ -1288,6 +1496,14 @@ class Tinypool extends EventEmitterAsyncResource {
+@@ -1227,6 +1496,14 @@ class Tinypool extends EventEmitterAsyncResource {
      return this.#pool.completed
    }
  
@@ -358,10 +431,12 @@ index 34ea6d6..faebc62 100644
    get duration(): number {
      return performance.now() - this.#pool.start
    }
-@@ -1346,5 +1562,5 @@ const _workerId = process.__tinypool_state__?.workerId
+@@ -1283,5 +1560,7 @@ class Tinypool extends EventEmitterAsyncResource {
+ const _workerId = process.__tinypool_state__?.workerId
+ 
  export * from './common'
- // Any new public-facing class introduced in this module must be listed here;
- // it will not be accessible to package consumers otherwise.
 -export { Tinypool, Options, _workerId as workerId }
++// Any new public-facing class introduced in this module must be listed here;
++// it will not be accessible to package consumers otherwise.
 +export { Tinypool, Options, _workerId as workerId, TaskTimeoutError }
  export default Tinypool

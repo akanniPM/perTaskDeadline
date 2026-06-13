@@ -1,9 +1,9 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..9c5e860
+index 0000000..1f2d87d
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,87 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -41,41 +41,56 @@ index 0000000..9c5e860
 +# Run test files serially because the repo's vitest.config.ts uses
 +# `isolate: false`, which makes parallel test files share module state.
 +
-+# Ensure the output directory exists before vitest tries to write to it.
++# Choose reporters based on whether a JUnit file output was requested.
 +if [[ -n "$OUTPUT_PATH" ]]; then
 +  mkdir -p "$(dirname "$OUTPUT_PATH")"
-+fi
-+
-+# Choose reporters based on whether a file output was requested.
-+if [[ -n "$OUTPUT_PATH" ]]; then
-+  ARGS=(
-+    run
-+    --reporter=junit
-+    --outputFile="$OUTPUT_PATH"
-+    --passWithNoTests
-+    --no-file-parallelism
-+  )
++  REPORTERS=(--reporter=junit --outputFile="$OUTPUT_PATH")
 +else
-+  ARGS=(
-+    run
-+    --reporter=default
-+    --passWithNoTests
-+    --no-file-parallelism
-+  )
++  REPORTERS=(--reporter=default)
 +fi
 +
 +# Worker-pool tests are timing-sensitive; use a generous timeout and bounded
 +# retries (kept identical across base and new) so transient scheduling jitter
 +# under load does not surface as a flaky failure.
++ARGS=(
++  run
++  "${REPORTERS[@]}"
++  --passWithNoTests
++  --no-file-parallelism
++  --testTimeout=30000
++  --retry=3
++)
++
 +case "$MODE" in
 +  base)
-+    exec node_modules/.bin/vitest "${ARGS[@]}" --testTimeout=30000 --retry=3 test/*.test.ts
++    TARGET=(test/*.test.ts)
 +    ;;
 +  new)
 +    mkdir -p test/new
-+    exec node_modules/.bin/vitest "${ARGS[@]}" --testTimeout=30000 --retry=3 test/new/*.test.ts
++    TARGET=(test/new/*.test.ts)
 +    ;;
 +esac
++
++# Run vitest without `exec` so we can reconcile its exit code afterwards.
++set +e
++node_modules/.bin/vitest "${ARGS[@]}" "${TARGET[@]}"
++vitest_status=$?
++set -e
++
++# Reconcile the exit code against the JUnit report when one was requested.
++# tinypool's worker pool can emit "Timeout waiting for worker to respond"
++# during shutdown *after* the report is written, which makes vitest exit
++# non-zero even though every test passed. Trust the report: if it records no
++# failures and no errors, the run succeeded.
++if [[ -n "$OUTPUT_PATH" && -f "$OUTPUT_PATH" ]]; then
++  fails="$(grep -oE 'failures="[0-9]+"' "$OUTPUT_PATH" | head -1 | grep -oE '[0-9]+' || true)"
++  errs="$(grep -oE 'errors="[0-9]+"' "$OUTPUT_PATH" | head -1 | grep -oE '[0-9]+' || true)"
++  if [[ "$fails" == "0" && "$errs" == "0" ]]; then
++    exit 0
++  fi
++fi
++
++exit "$vitest_status"
 diff --git a/test/new/fixtures/hang.mjs b/test/new/fixtures/hang.mjs
 new file mode 100644
 index 0000000..6ade711

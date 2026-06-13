@@ -14,3 +14,6 @@ debug_test.mjs
 solution_check.txt
 problem_description.md
 PerTaskDeadline
+
+# delivered via test.patch; not tracked
+test.sh

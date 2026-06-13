@@ -2,7 +2,7 @@
 
 ## Repository
 - **URL**: https://github.com/tinylibs/tinypool
-- **Base commit**: e31ef8c
+- **Base commit**: abc247f
 
 ## Problem
 
