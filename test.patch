@@ -1,9 +1,9 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..1f2d87d
+index 0000000..bb8040a
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,116 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -41,20 +41,24 @@ index 0000000..1f2d87d
 +# Run test files serially because the repo's vitest.config.ts uses
 +# `isolate: false`, which makes parallel test files share module state.
 +
-+# Choose reporters based on whether a JUnit file output was requested.
++# Always write a JUnit report. When --output_path is given write it there
++# (the evaluator reads it); otherwise write to a temp file so the run can
++# still be reconciled. The report is the authoritative result.
 +if [[ -n "$OUTPUT_PATH" ]]; then
 +  mkdir -p "$(dirname "$OUTPUT_PATH")"
-+  REPORTERS=(--reporter=junit --outputFile="$OUTPUT_PATH")
++  REPORT="$OUTPUT_PATH"
 +else
-+  REPORTERS=(--reporter=default)
++  REPORT="$(mktemp)"
 +fi
++rm -f "$REPORT"
 +
 +# Worker-pool tests are timing-sensitive; use a generous timeout and bounded
 +# retries (kept identical across base and new) so transient scheduling jitter
 +# under load does not surface as a flaky failure.
 +ARGS=(
 +  run
-+  "${REPORTERS[@]}"
++  --reporter=junit
++  --outputFile="$REPORT"
 +  --passWithNoTests
 +  --no-file-parallelism
 +  --testTimeout=30000
@@ -71,26 +75,51 @@ index 0000000..1f2d87d
 +    ;;
 +esac
 +
-+# Run vitest without `exec` so we can reconcile its exit code afterwards.
++# Run vitest in the background. tinypool's worker pool can leave the vitest
++# pool-runner blocked on "Timeout waiting for worker to respond" during
++# shutdown *after* the JUnit report has been written, which would otherwise
++# hang this script until the evaluator kills it (losing the report). So: once
++# the report is complete, give vitest a brief grace period and then terminate
++# any lingering shutdown so the script always exits cleanly.
 +set +e
-+node_modules/.bin/vitest "${ARGS[@]}" "${TARGET[@]}"
++node_modules/.bin/vitest "${ARGS[@]}" "${TARGET[@]}" &
++vpid=$!
++
++reported=0
++for _ in $(seq 1 2400); do        # hard cap ~20 min
++  if ! kill -0 "$vpid" 2>/dev/null; then
++    break                          # vitest exited on its own
++  fi
++  if [[ -f "$REPORT" ]] && grep -q "</testsuites>" "$REPORT" 2>/dev/null; then
++    reported=1
++    sleep 2                        # let a clean exit happen if it's about to
++    if kill -0 "$vpid" 2>/dev/null; then
++      kill -TERM "$vpid" 2>/dev/null
++      sleep 2
++      kill -KILL "$vpid" 2>/dev/null
++    fi
++    break
++  fi
++  sleep 0.5
++done
++wait "$vpid" 2>/dev/null
 +vitest_status=$?
 +set -e
 +
-+# Reconcile the exit code against the JUnit report when one was requested.
-+# tinypool's worker pool can emit "Timeout waiting for worker to respond"
-+# during shutdown *after* the report is written, which makes vitest exit
-+# non-zero even though every test passed. Trust the report: if it records no
-+# failures and no errors, the run succeeded.
-+if [[ -n "$OUTPUT_PATH" && -f "$OUTPUT_PATH" ]]; then
-+  fails="$(grep -oE 'failures="[0-9]+"' "$OUTPUT_PATH" | head -1 | grep -oE '[0-9]+' || true)"
-+  errs="$(grep -oE 'errors="[0-9]+"' "$OUTPUT_PATH" | head -1 | grep -oE '[0-9]+' || true)"
++# Decide the exit code from the authoritative JUnit report. A run whose report
++# records no failures and no errors succeeded even if the process was later
++# terminated on a worker-shutdown timeout.
++if [[ -f "$REPORT" ]] && grep -q "</testsuites>" "$REPORT" 2>/dev/null; then
++  fails="$(grep -oE 'failures="[0-9]+"' "$REPORT" | head -1 | grep -oE '[0-9]+' || true)"
++  errs="$(grep -oE 'errors="[0-9]+"' "$REPORT" | head -1 | grep -oE '[0-9]+' || true)"
 +  if [[ "$fails" == "0" && "$errs" == "0" ]]; then
 +    exit 0
 +  fi
++  exit 1
 +fi
 +
-+exit "$vitest_status"
++# No usable report (vitest never produced one): surface the process status.
++exit "${vitest_status:-1}"
 diff --git a/test/new/fixtures/hang.mjs b/test/new/fixtures/hang.mjs
 new file mode 100644
 index 0000000..6ade711
