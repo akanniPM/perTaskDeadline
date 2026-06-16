@@ -1,16 +1,35 @@
-diff --git a/src/index.ts b/src/index.ts
-index 883c89a..faebc62 100644
---- a/src/index.ts
-+++ b/src/index.ts
-@@ -98,6 +98,39 @@ class CancelError extends Error {
-   }
- }
- 
-+// Any new error class added for the public API should follow the same
-+// pattern: define as a class here, expose a `name` getter, and add it to
-+// the named export list at the bottom of this file so callers can import it.
+diff --git a/src/common.ts b/src/common.ts
+index 674027a..42e053f 100644
+--- a/src/common.ts
++++ b/src/common.ts
+@@ -143,3 +143,15 @@ export function isTaskQueue(value: any): boolean {
+ export const kRequestCountField = 0
+ export const kResponseCountField = 1
+ export const kFieldCount = 2
 +
-+interface TaskTimeoutErrorOptions {
++// Public surface of the per-task deadline feature, re-exported here so it rides
++// along with `export * from './common'` in the package entry point.
++export { TaskTimeoutError, TinypoolEvent } from './deadline'
++export type {
++  TaskTimeoutErrorFields,
++  TinypoolEventName,
++  TaskTimeoutPayload,
++  TaskTimeoutGracePayload,
++  TaskTimeoutTerminationPayload,
++  DeadlineStats,
++} from './deadline'
+diff --git a/src/deadline/errors.ts b/src/deadline/errors.ts
+new file mode 100644
+index 0000000..d6b7318
+--- /dev/null
++++ b/src/deadline/errors.ts
+@@ -0,0 +1,37 @@
++// Error raised when a task exceeds its configured deadline and the pool gives
++// up waiting for it. Carries the timing budget that was in force plus a record
++// of what the pool did about it (whether it entered the grace window, whether a
++// teardown hook ran, and whether that teardown finished in time).
++
++export interface TaskTimeoutErrorFields {
 +  taskTimeout: number
 +  gracePeriod: number
 +  graceEntered: boolean
@@ -18,31 +37,511 @@ index 883c89a..faebc62 100644
 +  teardownCompleted: boolean
 +}
 +
-+class TaskTimeoutError extends Error {
++export class TaskTimeoutError extends Error {
++  // Stable, machine-readable discriminator. Lets callers branch on the error
++  // without relying on `instanceof` across module/realm boundaries.
++  readonly code = 'ETASKTIMEOUT'
++
 +  taskTimeout: number
 +  gracePeriod: number
 +  graceEntered: boolean
 +  teardownAttempted: boolean
 +  teardownCompleted: boolean
 +
-+  constructor(options: TaskTimeoutErrorOptions) {
-+    super(`Task timed out after ${options.taskTimeout}ms`)
-+    this.taskTimeout = options.taskTimeout
-+    this.gracePeriod = options.gracePeriod
-+    this.graceEntered = options.graceEntered
-+    this.teardownAttempted = options.teardownAttempted
-+    this.teardownCompleted = options.teardownCompleted
++  constructor(fields: TaskTimeoutErrorFields) {
++    super(`Task timed out after ${fields.taskTimeout}ms`)
++    this.taskTimeout = fields.taskTimeout
++    this.gracePeriod = fields.gracePeriod
++    this.graceEntered = fields.graceEntered
++    this.teardownAttempted = fields.teardownAttempted
++    this.teardownCompleted = fields.teardownCompleted
 +  }
 +
-+  get name() {
++  get name(): string {
 +    return 'TaskTimeoutError'
 +  }
 +}
+diff --git a/src/deadline/events.ts b/src/deadline/events.ts
+new file mode 100644
+index 0000000..822c30e
+--- /dev/null
++++ b/src/deadline/events.ts
+@@ -0,0 +1,77 @@
++// Event names the pool emits over the lifetime of a deadline, plus the shapes
++// of their payloads and small builders so every emit site produces a consistent
++// object.
 +
- type ResourceLimits = Worker extends {
-   resourceLimits?: infer T
- }
-@@ -155,6 +188,8 @@ interface Options {
++export const TinypoolEvent = {
++  // taskTimeout has elapsed; the pool is about to act on it.
++  TaskTimeout: 'taskTimeout',
++  // The grace window opened (only emitted when gracePeriod > 0).
++  TaskTimeoutGrace: 'taskTimeoutGrace',
++  // The worker was hard-terminated to reclaim the slot.
++  TaskTimeoutTermination: 'taskTimeoutTermination',
++} as const
++
++export type TinypoolEventName =
++  (typeof TinypoolEvent)[keyof typeof TinypoolEvent]
++
++export interface TaskTimeoutPayload {
++  taskId: number
++  workerId: number
++  taskTimeout: number
++  gracePeriod: number
++}
++
++export interface TaskTimeoutGracePayload {
++  taskId: number
++  workerId: number
++  taskTimeout: number
++  gracePeriod: number
++}
++
++export interface TaskTimeoutTerminationPayload {
++  taskId: number
++  workerId: number
++  taskTimeout: number
++  gracePeriod: number
++  graceEntered: boolean
++  teardownAttempted: boolean
++  teardownCompleted: boolean
++}
++
++export function buildTimeoutPayload(
++  taskId: number,
++  workerId: number,
++  taskTimeout: number,
++  gracePeriod: number
++): TaskTimeoutPayload {
++  return { taskId, workerId, taskTimeout, gracePeriod }
++}
++
++export function buildGracePayload(
++  taskId: number,
++  workerId: number,
++  taskTimeout: number,
++  gracePeriod: number
++): TaskTimeoutGracePayload {
++  return { taskId, workerId, taskTimeout, gracePeriod }
++}
++
++export function buildTerminationPayload(
++  taskId: number,
++  workerId: number,
++  taskTimeout: number,
++  gracePeriod: number,
++  graceEntered: boolean,
++  teardownAttempted: boolean,
++  teardownCompleted: boolean
++): TaskTimeoutTerminationPayload {
++  return {
++    taskId,
++    workerId,
++    taskTimeout,
++    gracePeriod,
++    graceEntered,
++    teardownAttempted,
++    teardownCompleted,
++  }
++}
+diff --git a/src/deadline/index.ts b/src/deadline/index.ts
+new file mode 100644
+index 0000000..687f4d9
+--- /dev/null
++++ b/src/deadline/index.ts
+@@ -0,0 +1,29 @@
++// Public surface of the deadline subsystem, re-exported so the rest of the
++// codebase (and package consumers, via the main entry) can import from one
++// place.
++
++export { TaskTimeoutError } from './errors'
++export type { TaskTimeoutErrorFields } from './errors'
++export {
++  TinypoolEvent,
++  buildGracePayload,
++  buildTerminationPayload,
++  buildTimeoutPayload,
++} from './events'
++export type {
++  TinypoolEventName,
++  TaskTimeoutPayload,
++  TaskTimeoutGracePayload,
++  TaskTimeoutTerminationPayload,
++} from './events'
++export { DeadlineMetrics } from './metrics'
++export type { DeadlineStats } from './metrics'
++export {
++  parseTaskTimeout,
++  parseGracePeriod,
++  validateDeadlineOptions,
++} from './options'
++export { resolveDeadline } from './resolve'
++export type { DeadlineConfigInput, ResolvedDeadline } from './resolve'
++export { DeadlineScheduler } from './scheduler'
++export type { DeadlineHost, SchedulableTask } from './scheduler'
+diff --git a/src/deadline/metrics.ts b/src/deadline/metrics.ts
+new file mode 100644
+index 0000000..6fd37ce
+--- /dev/null
++++ b/src/deadline/metrics.ts
+@@ -0,0 +1,35 @@
++// Running tallies of deadline activity for a pool. Counters only ever move
++// forward; `snapshot()` hands back a plain copy so callers can read a coherent
++// set of values without being able to mutate the pool's internal state.
++
++export interface DeadlineStats {
++  timeouts: number
++  graceEntries: number
++  terminations: number
++}
++
++export class DeadlineMetrics {
++  timeouts = 0
++  graceEntries = 0
++  terminations = 0
++
++  recordTimeout(): void {
++    this.timeouts++
++  }
++
++  recordGraceEntry(): void {
++    this.graceEntries++
++  }
++
++  recordTermination(): void {
++    this.terminations++
++  }
++
++  snapshot(): DeadlineStats {
++    return {
++      timeouts: this.timeouts,
++      graceEntries: this.graceEntries,
++      terminations: this.terminations,
++    }
++  }
++}
+diff --git a/src/deadline/options.ts b/src/deadline/options.ts
+new file mode 100644
+index 0000000..2095c63
+--- /dev/null
++++ b/src/deadline/options.ts
+@@ -0,0 +1,51 @@
++// Validation and normalization for the deadline options (`taskTimeout` and
++// `gracePeriod`). Bad values fail loudly with a TypeError at the point of
++// configuration rather than being silently ignored, so a typo like
++// `taskTimeout: -1` or `taskTimeout: '500'` is caught immediately.
++//
++// Accepted "disable" forms are deliberately permissive: leaving an option out,
++// passing `undefined`/`null`, or passing `0` all mean "no deadline". For
++// `taskTimeout`, `Infinity` is also treated as "no deadline". Everything else
++// must be a real, non-negative number.
++
++import { isNumber } from '../utils'
++
++function reject(field: string, value: unknown, reason: string): never {
++  const shown =
++    typeof value === 'string' ? JSON.stringify(value) : String(value)
++  throw new TypeError(`${field} ${reason} (received ${typeof value}: ${shown})`)
++}
++
++// Returns the effective timeout in ms, or `undefined` when there is no
++// deadline. Throws TypeError on a value that is neither a valid duration nor a
++// recognized "disable" form.
++export function parseTaskTimeout(value: unknown): number | undefined {
++  if (value === undefined || value === null) return undefined
++  if (!isNumber(value)) reject('taskTimeout', value, 'must be a number')
++  if (Number.isNaN(value)) reject('taskTimeout', value, 'must not be NaN')
++  if (value < 0) reject('taskTimeout', value, 'must not be negative')
++  // 0 and Infinity both mean "run without a deadline".
++  if (value === 0 || !Number.isFinite(value)) return undefined
++  return value
++}
++
++// Returns the grace window in ms (>= 0). Unlike taskTimeout, the grace window
++// must be finite. Throws TypeError on an invalid value.
++export function parseGracePeriod(value: unknown): number {
++  if (value === undefined || value === null) return 0
++  if (!isNumber(value)) reject('gracePeriod', value, 'must be a number')
++  if (Number.isNaN(value)) reject('gracePeriod', value, 'must not be NaN')
++  if (!Number.isFinite(value)) reject('gracePeriod', value, 'must be finite')
++  if (value < 0) reject('gracePeriod', value, 'must not be negative')
++  return value
++}
++
++// Throws if either option is invalid; used to validate a whole options bag up
++// front (pool construction or a per-call override) without keeping the result.
++export function validateDeadlineOptions(opts: {
++  taskTimeout?: unknown
++  gracePeriod?: unknown
++}): void {
++  if ('taskTimeout' in opts) parseTaskTimeout(opts.taskTimeout)
++  if ('gracePeriod' in opts) parseGracePeriod(opts.gracePeriod)
++}
+diff --git a/src/deadline/resolve.ts b/src/deadline/resolve.ts
+new file mode 100644
+index 0000000..9f1216c
+--- /dev/null
++++ b/src/deadline/resolve.ts
+@@ -0,0 +1,42 @@
++// Works out the deadline that actually applies to a single task by layering a
++// per-call override on top of the pool-level defaults.
++//
++// Precedence, evaluated per option independently:
++//   1. If the caller passed the option to `run()` (the key is present), that
++//      value wins — even if it is `0`/`undefined`, which is how a caller opts a
++//      single task out of a pool-wide deadline.
++//   2. Otherwise the pool default applies.
++//
++// The presence check (key-in-options) matters: an explicit `taskTimeout: 0`
++// must override a pool default of, say, 500, whereas simply not mentioning
++// `taskTimeout` should inherit the pool default. A plain `?? `/`||` cannot tell
++// those two cases apart, so callers must pass the presence flags.
++
++import { parseGracePeriod, parseTaskTimeout } from './options'
++
++export interface DeadlineConfigInput {
++  taskTimeout?: unknown
++  gracePeriod?: unknown
++  hasTaskTimeout: boolean
++  hasGracePeriod: boolean
++}
++
++export interface ResolvedDeadline {
++  taskTimeout: number | undefined
++  gracePeriod: number
++}
++
++export function resolveDeadline(
++  perCall: DeadlineConfigInput,
++  poolDefaults: { taskTimeout?: unknown; gracePeriod?: unknown }
++): ResolvedDeadline {
++  const taskTimeout = perCall.hasTaskTimeout
++    ? parseTaskTimeout(perCall.taskTimeout)
++    : parseTaskTimeout(poolDefaults.taskTimeout)
++
++  const gracePeriod = perCall.hasGracePeriod
++    ? parseGracePeriod(perCall.gracePeriod)
++    : parseGracePeriod(poolDefaults.gracePeriod)
++
++  return { taskTimeout, gracePeriod }
++}
+diff --git a/src/deadline/scheduler.ts b/src/deadline/scheduler.ts
+new file mode 100644
+index 0000000..1fca082
+--- /dev/null
++++ b/src/deadline/scheduler.ts
+@@ -0,0 +1,189 @@
++// The timing engine for per-task deadlines. It owns the two timers behind a
++// deadline (the initial timeout and the optional grace window) and drives the
++// phase transitions: fire -> (grace) -> hard-terminate. It deliberately knows
++// nothing about how a pool is built; everything pool-specific (settling a task,
++// running a teardown, killing a worker) is reached through the `DeadlineHost`
++// hooks, so this file has no dependency on the main pool module.
++//
++// Timer note: both timers are `unref()`-ed and every fire path re-checks that
++// the task is still assigned to the worker. A task that finishes normally is
++// simply removed from the worker, so a later-firing timer becomes a no-op — no
++// explicit disarm is required on the happy path.
++
++import { DeadlineMetrics } from './metrics'
++import { TaskTimeoutError } from './errors'
++import {
++  TinypoolEvent,
++  buildGracePayload,
++  buildTerminationPayload,
++  buildTimeoutPayload,
++} from './events'
++
++// A task as seen by the scheduler. The concrete TaskInfo in the pool module
++// structurally satisfies this; the timer/error fields are written back onto it
++// so other pool code (e.g. a worker 'exit' handler) can read the pending error.
++export interface SchedulableTask {
++  taskId: number
++  taskTimeout: number | undefined
++  gracePeriod: number | undefined
++  deadlineTimer: NodeJS.Timeout | null
++  graceTimer: NodeJS.Timeout | null
++  pendingDeadlineError: TaskTimeoutError | null
++}
++
++export interface SchedulableWorker {
++  workerId: number
++}
++
++export interface DeadlineHost {
++  readonly terminateTimeout: number | undefined
++  // Is `taskId` still assigned to this worker (i.e. not yet settled)?
++  hasTask(worker: SchedulableWorker, taskId: number): boolean
++  emit(name: string, payload: unknown): void
++  // Remove the worker from the pool's active set and return its remaining
++  // (sibling) tasks, excluding the timed-out one, having cleared them from the
++  // worker. These siblings will be failed with the termination error.
++  detachWorker(worker: SchedulableWorker, timedOutTaskId: number): SchedulableTask[]
++  // Run the worker's teardown hook. Returns null when no teardown is configured.
++  postTeardown(worker: SchedulableWorker): Promise<void> | null
++  // Settle a task's promise with `error`.
++  settle(task: SchedulableTask, error: unknown): void
++  // The error used to fail sibling tasks of a terminated worker.
++  terminationError(): unknown
++  // Tear down the underlying worker thread/process.
++  killWorker(worker: SchedulableWorker): void
++  ensureMinimumWorkers(): void
++}
++
++export class DeadlineScheduler {
++  constructor(
++    private readonly host: DeadlineHost,
++    readonly metrics: DeadlineMetrics
++  ) {}
++
++  // Start the deadline for a task that has just been posted to a worker. No-op
++  // when the task has no (or a disabled) timeout — by this point taskTimeout is
++  // already normalized to a positive finite number or undefined.
++  arm(task: SchedulableTask, worker: SchedulableWorker): void {
++    const timeout = task.taskTimeout
++    if (timeout == null) return
++    const grace = task.gracePeriod ?? 0
++
++    task.deadlineTimer = setTimeout(() => {
++      task.deadlineTimer = null
++      if (!this.host.hasTask(worker, task.taskId)) return
++
++      this.metrics.recordTimeout()
++      this.host.emit(
++        TinypoolEvent.TaskTimeout,
++        buildTimeoutPayload(task.taskId, worker.workerId, timeout, grace)
++      )
++
++      if (grace <= 0) {
++        void this.hardTerminate(task, worker, timeout, grace, false)
++        return
++      }
++
++      this.metrics.recordGraceEntry()
++      this.host.emit(
++        TinypoolEvent.TaskTimeoutGrace,
++        buildGracePayload(task.taskId, worker.workerId, timeout, grace)
++      )
++      task.pendingDeadlineError = new TaskTimeoutError({
++        taskTimeout: timeout,
++        gracePeriod: grace,
++        graceEntered: true,
++        teardownAttempted: false,
++        teardownCompleted: false,
++      })
++
++      task.graceTimer = setTimeout(() => {
++        task.graceTimer = null
++        if (!this.host.hasTask(worker, task.taskId)) return
++        void this.hardTerminate(task, worker, timeout, grace, true)
++      }, grace).unref()
++    }, timeout).unref()
++  }
++
++  private clearTimers(task: SchedulableTask): void {
++    if (task.deadlineTimer !== null) {
++      clearTimeout(task.deadlineTimer)
++      task.deadlineTimer = null
++    }
++    if (task.graceTimer !== null) {
++      clearTimeout(task.graceTimer)
++      task.graceTimer = null
++    }
++  }
++
++  private rejectAfter(ms: number): Promise<never> {
++    return new Promise<never>((_, reject) =>
++      setTimeout(() => reject(new Error('Teardown timed out')), ms).unref()
++    )
++  }
++
++  async hardTerminate(
++    task: SchedulableTask,
++    worker: SchedulableWorker,
++    taskTimeout: number,
++    gracePeriod: number,
++    graceEntered: boolean
++  ): Promise<void> {
++    this.clearTimers(task)
++
++    const siblings = this.host.detachWorker(worker, task.taskId)
++    this.metrics.recordTermination()
++
++    let teardownAttempted = false
++    let teardownCompleted = false
++    const teardownPromise = this.host.postTeardown(worker)
++    if (teardownPromise !== null) {
++      teardownAttempted = true
++      try {
++        const budget = this.host.terminateTimeout
++        if (budget != null && budget > 0) {
++          await Promise.race([teardownPromise, this.rejectAfter(budget)])
++        } else {
++          await teardownPromise
++        }
++        teardownCompleted = true
++      } catch (err) {
++        // A teardown that throws or overruns its budget is reported on the
++        // pool's 'error' channel; it must not block the caller's rejection.
++        this.host.emit('error', err)
++      }
++    }
++
++    this.host.emit(
++      TinypoolEvent.TaskTimeoutTermination,
++      buildTerminationPayload(
++        task.taskId,
++        worker.workerId,
++        taskTimeout,
++        gracePeriod,
++        graceEntered,
++        teardownAttempted,
++        teardownCompleted
++      )
++    )
++
++    this.host.settle(
++      task,
++      new TaskTimeoutError({
++        taskTimeout,
++        gracePeriod,
++        graceEntered,
++        teardownAttempted,
++        teardownCompleted,
++      })
++    )
++
++    const terminationError = this.host.terminationError()
++    for (const sibling of siblings) {
++      this.host.settle(sibling, terminationError)
++    }
++
++    this.host.killWorker(worker)
++    this.host.ensureMinimumWorkers()
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index 883c89a..cd5c01c 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -36,6 +36,16 @@ import {
+ } from './common'
+ import ThreadWorker from './runtime/thread-worker'
+ import ProcessWorker from './runtime/process-worker'
++import {
++  DeadlineMetrics,
++  DeadlineScheduler,
++  TaskTimeoutError,
++  resolveDeadline,
++  validateDeadlineOptions,
++  type DeadlineHost,
++  type SchedulableTask,
++  type SchedulableWorker,
++} from './deadline'
+ 
+ declare global {
+   namespace NodeJS {
+@@ -155,6 +165,8 @@ interface Options {
    isolateWorkers?: boolean
    teardown?: string
    serialization?: SerializationType
@@ -51,7 +550,7 @@ index 883c89a..faebc62 100644
  }
  
  interface FilledOptions extends Options {
-@@ -191,6 +226,8 @@ interface RunOptions {
+@@ -191,6 +203,8 @@ interface RunOptions {
    signal?: AbortSignalAny | null
    name?: string | null
    runtime?: Options['runtime']
@@ -60,10 +559,16 @@ index 883c89a..faebc62 100644
  }
  
  interface FilledRunOptions extends RunOptions {
-@@ -272,6 +309,11 @@ class TaskInfo extends AsyncResource implements Task {
+@@ -272,6 +286,17 @@ class TaskInfo extends AsyncResource implements Task {
    created: number
    started: number
    cancel: () => void
++  // Per-task deadline state. taskTimeout/gracePeriod are already normalized
++  // (taskTimeout: positive finite ms or undefined; gracePeriod: >= 0). The
++  // timers and pending error are managed by the DeadlineScheduler; the pending
++  // error is read by WorkerInfo.destroy so a worker that exits during a
++  // hard-termination rejects the task with the deadline error, not a generic
++  // termination error.
 +  taskTimeout: number | undefined
 +  gracePeriod: number | undefined
 +  deadlineTimer: NodeJS.Timeout | null = null
@@ -72,7 +577,7 @@ index 883c89a..faebc62 100644
  
    constructor(
      task: any,
-@@ -281,7 +323,9 @@ class TaskInfo extends AsyncResource implements Task {
+@@ -281,7 +306,9 @@ class TaskInfo extends AsyncResource implements Task {
      callback: TaskCallback,
      abortSignal: AbortSignalAny | null,
      triggerAsyncId: number,
@@ -83,7 +588,7 @@ index 883c89a..faebc62 100644
    ) {
      super('Tinypool.Task', { requireManualDestroy: true, triggerAsyncId })
      this.callback = callback
-@@ -289,6 +333,8 @@ class TaskInfo extends AsyncResource implements Task {
+@@ -289,6 +316,8 @@ class TaskInfo extends AsyncResource implements Task {
      this.transferList = transferList
      this.cancel = () => this.callback(new CancelError(), null)
      this.channel = channel
@@ -92,57 +597,16 @@ index 883c89a..faebc62 100644
  
      // If the task is a Transferable returned by
      // Tinypool.move(), then add it to the transferList
-@@ -319,6 +365,24 @@ class TaskInfo extends AsyncResource implements Task {
-   }
- 
-   done(err: unknown | null, result?: any): void {
-+    // This is the single settling point for the task's promise. The callback
-+    // captures `err` and `result` by value at the moment of this call —
-+    // mutations to an error object made after this returns will not be
-+    // visible to the caller. All fields that belong on the rejection reason
-+    // must be finalised before this method is invoked.
-+    //
-+    // Analogy: CancelError above is fully constructed before being passed
-+    // here; no property is set on it afterwards. The same discipline applies
-+    // to any error object passed to done() — including errors that carry
-+    // async-resolved outcome fields such as completion status.
-+    //
-+    // Worked example — deadline hard-termination with teardown:
-+    //   const err = new TaskTimeoutError({ ..., teardownCompleted: false })
-+    //   taskInfo.deadlineError = err
-+    //   const completed = await runTeardownWithBudget(...)  // async!
-+    //   err.teardownCompleted = completed   // mutate BEFORE done()
-+    //   taskInfo.done(err)                  // ← captures err here; done
-+    //   // err.teardownCompleted = true     // ← too late, caller won't see it
-     this.emitDestroy() // `TaskInfo`s are used only once.
-     this.runInAsyncScope(this.callback, null, err, result)
-     // If an abort signal was used, remove the listener from it when
-@@ -498,14 +562,35 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
+@@ -498,14 +527,19 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
      if (this.teardown && this.filename) {
        const { teardown, filename } = this
  
 -      await new Promise((resolve, reject) => {
-+      // Note: this teardown path is used for normal pool shutdown. A
-+      // deadline-driven hard-termination has different requirements:
-+      // it needs a bounded budget, its failure must surface on the pool's
-+      // 'error' event without delaying the caller's rejection, and its
-+      // outcome (completed vs not) must be recorded before done() is called.
-+      // Consider whether a separate code path is needed for that case.
-+      //
-+      // Worked example — deadline teardown contract:
-+      //   const completed = await runTeardownWithBudget(
-+      //     terminateTimeout,
-+      //     (err) => pool.emit('error', err)   // timeout fires this
-+      //   )                                    // resolves true/false
-+      //   err.teardownCompleted = completed    // set on error before done()
-+      //   taskInfo.done(err)                   // reject caller
-+      //   await worker.terminate()             // then kill the thread
-+      // A teardown that throws during shutdown must not reject destroy():
-+      // most callers invoke `void this._removeWorker(...)`, so a rejection
-+      // would surface as an unhandled rejection. Resolve regardless; a
-+      // deadline-driven teardown failure is reported on the pool's 'error'
-+      // event by the hard-termination path. The terminate-timeout rejection
-+      // below is unaffected.
++      // Resolve regardless of whether the teardown succeeds. Most callers
++      // invoke `void this.destroy(...)`, so a rejection here would surface as an
++      // unhandled rejection. A deadline-driven teardown failure is reported
++      // separately on the pool's 'error' event by the hard-termination path;
++      // the terminate-timeout rejection below is unaffected.
 +      await new Promise<void>((resolve) => {
          this.postTask(
            new TaskInfo(
@@ -155,7 +619,7 @@ index 883c89a..faebc62 100644
              null,
              1,
              undefined
-@@ -529,7 +614,7 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
+@@ -529,7 +563,7 @@ class WorkerInfo extends AsynchronouslyCreatedResource {
        this.port.close()
        this.clearIdleTimeout()
        for (const taskInfo of this.taskInfos.values()) {
@@ -164,240 +628,162 @@ index 883c89a..faebc62 100644
        }
        this.taskInfos.clear()
  
-@@ -643,10 +728,33 @@ class ThreadPool {
-   taskQueue: TaskQueue
-   skipQueue: TaskInfo[] = []
-   completed: number = 0
-+  taskTimeoutCount: number = 0
-+  taskTimeoutTerminationCount: number = 0
-   start: number = performance.now()
+@@ -647,10 +681,16 @@ class ThreadPool {
    inProcessPendingMessages: boolean = false
    startingUp: boolean = false
    workerFailsDuringBootstrap: boolean = false
-+  // Implementation note: state flags tracking deadline phases (e.g., a flag
-+  // indicating that the grace window was entered) must only be set when that
-+  // state is actually entered — not at the moment the initial timeout fires.
-+  // When gracePeriod is 0 the grace window is bypassed entirely; a 'grace
-+  // entered' flag must remain false on that path.
-+  //
-+  // Worked example using existing code: `workerFailsDuringBootstrap` above is
-+  // only set to `true` inside the 'error' handler when a failure is observed —
-+  // it is NOT set when a worker is first constructed. Apply the same principle
-+  // to any deadline-phase flag: set it only inside the branch that opens the
-+  // corresponding phase, not before checking whether that branch will execute.
-+  //
-+  // State table for a task with taskTimeout=T, gracePeriod=G:
-+  //
-+  //  Scenario                        graceEntered  teardownAttempted  teardownCompleted
-+  //  ─────────────────────────────── ───────────── ────────────────── ─────────────────
-+  //  Hard-kill (G=0), no teardown    false         false              false
-+  //  Hard-kill (G=0), teardown runs  false         true               true (or false)
-+  //  Grace elapsed, no teardown      true          false              false
-+  //  Grace elapsed, teardown runs    true          true               true (or false)
-+  //  Task settles during grace       —             (no termination; promise resolves/rejects naturally)
++  deadlineMetrics: DeadlineMetrics = new DeadlineMetrics()
++  deadline: DeadlineScheduler
  
    constructor(publicInterface: Tinypool, options: Options) {
      this.publicInterface = publicInterface
+     this.taskQueue = options.taskQueue || new ArrayTaskQueue()
++    this.deadline = new DeadlineScheduler(
++      this._deadlineHost(),
++      this.deadlineMetrics
++    )
+ 
+     const filename = options.filename
+       ? maybeFileURLToPath(options.filename)
+@@ -709,6 +749,74 @@ class ThreadPool {
+     }
+   }
+ 
++  // The pool-side operations the DeadlineScheduler needs to act on a breach,
++  // bundled so the scheduler stays decoupled from this class.
++  _deadlineHost(): DeadlineHost {
++    const pool = this
++    return {
++      get terminateTimeout(): number | undefined {
++        return pool.options.terminateTimeout
++      },
++      hasTask(worker: SchedulableWorker, taskId: number): boolean {
++        return (worker as unknown as WorkerInfo).taskInfos.has(taskId)
++      },
++      emit(name: string, payload: unknown): void {
++        pool.publicInterface.emit(name, payload)
++      },
++      detachWorker(
++        worker: SchedulableWorker,
++        timedOutTaskId: number
++      ): SchedulableTask[] {
++        const w = worker as unknown as WorkerInfo
++        w.freeWorkerId()
++        pool.workers.delete(w)
++        w.taskInfos.delete(timedOutTaskId)
++        const siblings = [...w.taskInfos.values()]
++        w.taskInfos.clear()
++        return siblings as unknown as SchedulableTask[]
++      },
++      postTeardown(worker: SchedulableWorker): Promise<void> | null {
++        const w = worker as unknown as WorkerInfo
++        if (!w.teardown || !w.filename) return null
++        const { teardown, filename } = w
++        return new Promise<void>((resolve, reject) => {
++          try {
++            w.postTask(
++              new TaskInfo(
++                {},
++                [],
++                filename,
++                teardown,
++                (error) => (error ? reject(error) : resolve()),
++                null,
++                1,
++                undefined
++              )
++            )
++          } catch (err) {
++            reject(err)
++          }
++        })
++      },
++      settle(task: SchedulableTask, error: unknown): void {
++        ;(task as unknown as TaskInfo).done(error)
++      },
++      terminationError(): unknown {
++        return Errors.ThreadTermination()
++      },
++      killWorker(worker: SchedulableWorker): void {
++        const w = worker as unknown as WorkerInfo
++        void w.worker.terminate().then(() => {
++          w.port.close()
++          w.clearIdleTimeout()
++        })
++      },
++      ensureMinimumWorkers(): void {
++        pool._ensureMinimumWorkers()
++      },
++    }
++  }
++
+   _addNewWorker(): void {
+     const workerIds = this.workerIds
+ 
 @@ -895,6 +1003,7 @@ class ThreadPool {
        const now = performance.now()
        taskInfo.started = now
        workerInfo.postTask(taskInfo)
-+      this._armDeadline(taskInfo, workerInfo)
++      this.deadline.arm(taskInfo, workerInfo)
        this._maybeDrain()
        return
      }
-@@ -913,6 +1022,11 @@ class ThreadPool {
+@@ -913,6 +1022,19 @@ class ThreadPool {
    }
  
    runTask(task: any, options: RunOptions): Promise<any> {
-+    const resolvedTaskTimeout =
-+      'taskTimeout' in options ? options.taskTimeout : this.options.taskTimeout
-+    const resolvedGracePeriod =
-+      'gracePeriod' in options ? options.gracePeriod : this.options.gracePeriod
++    // Resolve the effective deadline (per-call override layered over the pool
++    // default). This validates the values and throws TypeError synchronously on
++    // a bad per-call option, before any worker is touched.
++    const { taskTimeout, gracePeriod } = resolveDeadline(
++      {
++        taskTimeout: options.taskTimeout,
++        gracePeriod: options.gracePeriod,
++        hasTaskTimeout: 'taskTimeout' in options,
++        hasGracePeriod: 'gracePeriod' in options,
++      },
++      this.options
++    )
 +
      let { filename, name } = options
      const { transferList = [], signal = null, channel } = options
  
-@@ -957,7 +1071,9 @@ class ThreadPool {
+@@ -957,7 +1079,9 @@ class ThreadPool {
        },
        signal,
        this.publicInterface.asyncResource.asyncId(),
 -      channel
 +      channel,
-+      resolvedTaskTimeout,
-+      resolvedGracePeriod
++      taskTimeout,
++      gracePeriod
      )
  
      if (signal !== null) {
-@@ -1038,6 +1154,7 @@ class ThreadPool {
+@@ -1038,6 +1162,7 @@ class ThreadPool {
      const now = performance.now()
      taskInfo.started = now
      workerInfo.postTask(taskInfo)
-+    this._armDeadline(taskInfo, workerInfo)
++    this.deadline.arm(taskInfo, workerInfo)
      this._maybeDrain()
  
      return ret
-@@ -1079,6 +1196,149 @@ class ThreadPool {
-     }
-   }
+@@ -1142,6 +1267,10 @@ class Tinypool extends EventEmitterAsyncResource {
+   #pool: ThreadPool
  
-+  _armDeadline(taskInfo: TaskInfo, workerInfo: WorkerInfo): void {
-+    const timeout = taskInfo.taskTimeout
-+    if (timeout == null || !Number.isFinite(timeout) || timeout <= 0) return
+   constructor(options: Options = {}) {
++    // Fail fast on a malformed taskTimeout/gracePeriod rather than silently
++    // running without the deadline the caller asked for.
++    validateDeadlineOptions(options)
 +
-+    const rawGrace = taskInfo.gracePeriod ?? 0
-+    const normGrace = Number.isFinite(rawGrace) && rawGrace > 0 ? rawGrace : 0
-+
-+    taskInfo.deadlineTimer = setTimeout(() => {
-+      taskInfo.deadlineTimer = null
-+      if (!workerInfo.taskInfos.has(taskInfo.taskId)) return
-+
-+      this.taskTimeoutCount++
-+      this.publicInterface.emit('taskTimeout', {
-+        taskId: taskInfo.taskId,
-+        workerId: workerInfo.workerId,
-+        taskTimeout: timeout,
-+        gracePeriod: rawGrace,
-+      })
-+
-+      if (normGrace <= 0) {
-+        void this._hardTerminate(taskInfo, workerInfo, timeout, rawGrace, false)
-+        return
-+      }
-+
-+      taskInfo.pendingDeadlineError = new TaskTimeoutError({
-+        taskTimeout: timeout,
-+        gracePeriod: normGrace,
-+        graceEntered: true,
-+        teardownAttempted: false,
-+        teardownCompleted: false,
-+      })
-+
-+      taskInfo.graceTimer = setTimeout(() => {
-+        taskInfo.graceTimer = null
-+        if (!workerInfo.taskInfos.has(taskInfo.taskId)) return
-+        void this._hardTerminate(taskInfo, workerInfo, timeout, normGrace, true)
-+      }, normGrace).unref()
-+    }, timeout).unref()
-+  }
-+
-+  async _hardTerminate(
-+    taskInfo: TaskInfo,
-+    workerInfo: WorkerInfo,
-+    taskTimeout: number,
-+    gracePeriod: number,
-+    graceEntered: boolean
-+  ): Promise<void> {
-+    if (taskInfo.deadlineTimer !== null) {
-+      clearTimeout(taskInfo.deadlineTimer)
-+      taskInfo.deadlineTimer = null
-+    }
-+    if (taskInfo.graceTimer !== null) {
-+      clearTimeout(taskInfo.graceTimer)
-+      taskInfo.graceTimer = null
-+    }
-+
-+    workerInfo.freeWorkerId()
-+    this.workers.delete(workerInfo)
-+
-+    workerInfo.taskInfos.delete(taskInfo.taskId)
-+
-+    const siblings = [...workerInfo.taskInfos.values()]
-+    workerInfo.taskInfos.clear()
-+
-+    this.taskTimeoutTerminationCount++
-+
-+    let teardownAttempted = false
-+    let teardownCompleted = false
-+    const terminateTimeout = this.options.terminateTimeout
-+
-+    if (workerInfo.teardown && workerInfo.filename) {
-+      teardownAttempted = true
-+      const { teardown, filename } = workerInfo
-+
-+      const teardownPromise = new Promise<void>((res, rej) => {
-+        try {
-+          workerInfo.postTask(
-+            new TaskInfo(
-+              {},
-+              [],
-+              filename,
-+              teardown,
-+              (err) => (err ? rej(err) : res()),
-+              null,
-+              1,
-+              undefined
-+            )
-+          )
-+        } catch (e) {
-+          rej(e)
-+        }
-+      })
-+
-+      try {
-+        if (terminateTimeout != null && terminateTimeout > 0) {
-+          await Promise.race([
-+            teardownPromise,
-+            new Promise<never>((_, rej) =>
-+              setTimeout(
-+                () => rej(new Error('Teardown timed out')),
-+                terminateTimeout
-+              ).unref()
-+            ),
-+          ])
-+        } else {
-+          await teardownPromise
-+        }
-+        teardownCompleted = true
-+      } catch (err) {
-+        this.publicInterface.emit('error', err)
-+      }
-+    }
-+
-+    this.publicInterface.emit('taskTimeoutTermination', {
-+      taskId: taskInfo.taskId,
-+      workerId: workerInfo.workerId,
-+      taskTimeout,
-+      gracePeriod,
-+      teardownAttempted,
-+    })
-+
-+    const deadlineErr = new TaskTimeoutError({
-+      taskTimeout,
-+      gracePeriod,
-+      graceEntered,
-+      teardownAttempted,
-+      teardownCompleted,
-+    })
-+
-+    taskInfo.done(deadlineErr)
-+
-+    for (const sibling of siblings) {
-+      sibling.done(Errors.ThreadTermination())
-+    }
-+
-+    void workerInfo.worker.terminate().then(() => {
-+      workerInfo.port.close()
-+      workerInfo.clearIdleTimeout()
-+    })
-+
-+    this._ensureMinimumWorkers()
-+  }
-+
-   async destroy() {
-     while (this.skipQueue.length > 0) {
-       const taskInfo: TaskInfo = this.skipQueue.shift() as TaskInfo
-@@ -1180,16 +1440,25 @@ class Tinypool extends EventEmitterAsyncResource {
-   }
- 
+     // convert fractional option values to int
+     if (
+       options.minThreads !== undefined &&
+@@ -1182,14 +1311,24 @@ class Tinypool extends EventEmitterAsyncResource {
    run(task: any, options: RunOptions = kDefaultRunOptions) {
-+    // Every per-call option that can override a pool-level default must be
-+    // explicitly destructured from `options` here and forwarded to runTask();
-+    // options not listed in the destructuring are silently dropped.
      const { transferList, filename, name, signal, runtime, channel } = options
--
+ 
 -    return this.#pool.runTask(task, {
-+    const perCallOpts: RunOptions = {
++    const runOptions: RunOptions = {
        transferList,
        filename,
        name,
@@ -406,37 +792,60 @@ index 883c89a..faebc62 100644
        channel,
 -    })
 +    }
++    // Forward the deadline overrides only when the caller actually supplied
++    // them, so an absent option inherits the pool default while an explicit
++    // `taskTimeout: 0` opts this one task out.
 +    if ('taskTimeout' in options) {
-+      perCallOpts.taskTimeout = options.taskTimeout
++      runOptions.taskTimeout = options.taskTimeout
 +    }
 +    if ('gracePeriod' in options) {
-+      perCallOpts.gracePeriod = options.gracePeriod
++      runOptions.gracePeriod = options.gracePeriod
 +    }
-+    return this.#pool.runTask(task, perCallOpts)
++    return this.#pool.runTask(task, runOptions)
    }
  
    async destroy() {
-@@ -1227,6 +1496,14 @@ class Tinypool extends EventEmitterAsyncResource {
+@@ -1227,6 +1366,27 @@ class Tinypool extends EventEmitterAsyncResource {
      return this.#pool.completed
    }
  
++  // Number of tasks whose taskTimeout elapsed.
 +  get taskTimeoutCount(): number {
-+    return this.#pool.taskTimeoutCount
++    return this.#pool.deadlineMetrics.timeouts
 +  }
 +
++  // Number of times a grace window was opened (subset of taskTimeoutCount;
++  // only tasks with gracePeriod > 0 contribute).
++  get taskTimeoutGraceCount(): number {
++    return this.#pool.deadlineMetrics.graceEntries
++  }
++
++  // Number of workers hard-terminated because a task blew its deadline.
 +  get taskTimeoutTerminationCount(): number {
-+    return this.#pool.taskTimeoutTerminationCount
++    return this.#pool.deadlineMetrics.terminations
++  }
++
++  // A coherent, copied snapshot of the deadline counters.
++  get deadlineStats() {
++    return this.#pool.deadlineMetrics.snapshot()
 +  }
 +
    get duration(): number {
      return performance.now() - this.#pool.start
    }
-@@ -1283,5 +1560,7 @@ class Tinypool extends EventEmitterAsyncResource {
- const _workerId = process.__tinypool_state__?.workerId
- 
- export * from './common'
--export { Tinypool, Options, _workerId as workerId }
-+// Any new public-facing class introduced in this module must be listed here;
-+// it will not be accessible to package consumers otherwise.
-+export { Tinypool, Options, _workerId as workerId, TaskTimeoutError }
- export default Tinypool
+diff --git a/src/utils.ts b/src/utils.ts
+index 50f8af2..a1d9f3f 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -7,3 +7,11 @@ export function stderr(): NodeJS.WriteStream | undefined {
+   // @ts-expect-error Node.js maps process.stderr to console._stderr
+   return console._stderr || process.stderr || undefined
+ }
++
++// Narrow type guard used by the deadline option validators. Kept here so the
++// `typeof x === 'number'` test (which, unlike most "is this a number" helpers,
++// intentionally accepts NaN/Infinity so callers can reject them with specific
++// messages) lives next to the other shared primitives.
++export function isNumber(value: unknown): value is number {
++  return typeof value === 'number'
++}
