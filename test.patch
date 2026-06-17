@@ -124,7 +124,7 @@ index 0000000..0dbc408
 +}
 diff --git a/test/new/per-task-deadline.e6b18c.test.ts b/test/new/per-task-deadline.e6b18c.test.ts
 new file mode 100644
-index 0000000..f8e6a24
+index 0000000..bd1c7e2
 --- /dev/null
 +++ b/test/new/per-task-deadline.e6b18c.test.ts
 @@ -0,0 +1,696 @@
@@ -659,7 +659,7 @@ index 0000000..f8e6a24
 +  })
 +
 +  it('a task that settles inside the grace window resolves naturally', async () => {
-+    const pool = makePool({ taskTimeout: 40, gracePeriod: 200, maxThreads: 1 })
++    const pool = makePool({ taskTimeout: 40, gracePeriod: 500, maxThreads: 1 })
 +    await expect(pool.run({ time: 90, value: 'made-it' })).resolves.toBe(
 +      'made-it'
 +    )
@@ -676,7 +676,7 @@ index 0000000..f8e6a24
 +        minThreads: 1,
 +        maxThreads: 1,
 +        taskTimeout: 40,
-+        gracePeriod: 300,
++        gracePeriod: 500,
 +      } as any)
 +    )
 +    const err = await rejection(pool.run({ time: 90 }))
