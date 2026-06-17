@@ -1,9 +1,9 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..da0f3f9
+index 0000000..dcca46b
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,68 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -41,12 +41,15 @@ index 0000000..da0f3f9
 +  base)
 +    TARGET=(test/*.test.ts)
 +    # --testTimeout: the suite has slow worker-spawn / child_process tests, so
-+    # give them a wide ceiling. The base files run serially in one reused worker
-+    # (the repo sets isolate:false), so the worker pools and socket listeners
-+    # they spawn accumulate across all ~16 files; raise the heap so that
-+    # accumulation does not exhaust the default limit and abort with no JUnit.
-+    # (NODE_OPTIONS is inherited by vitest's forked test worker.)
-+    EXTRA=(--testTimeout=30000)
++    # give them a wide ceiling.
++    # --isolate: the repo sets isolate:false, so all ~16 base files would share
++    # one reused test worker and the tinypool pools / socket listeners they spawn
++    # accumulate across the whole run, exhausting the heap and aborting with no
++    # JUnit. Isolating gives each file a fresh process so memory is reclaimed
++    # between files; this caps accumulation regardless of total size. Kept
++    # serial (--no-file-parallelism) so the fresh processes start one at a time.
++    # The heap bump is belt-and-suspenders headroom for any single slow file.
++    EXTRA=(--testTimeout=30000 --isolate)
 +    export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
 +    ;;
 +  new)
@@ -96,6 +99,21 @@ index 0000000..c7757be
 +export async function throwingTeardown() {
 +  throw new Error('teardown failed intentionally')
 +}
+diff --git a/test/new/fixtures/reject-after.mjs b/test/new/fixtures/reject-after.mjs
+new file mode 100644
+index 0000000..8a5a943
+--- /dev/null
++++ b/test/new/fixtures/reject-after.mjs
+@@ -0,0 +1,9 @@
++import { setTimeout as delay } from 'node:timers/promises'
++
++// Runs for `time` ms, then rejects on its own. Used to exercise a task that
++// throws inside the grace window (the caller must see this error, not a
++// TaskTimeoutError, and the worker must not be hard-terminated).
++export default async function task({ time = 100 } = {}) {
++  await delay(time)
++  throw new Error('task rejected naturally')
++}
 diff --git a/test/new/fixtures/sleep-named.mjs b/test/new/fixtures/sleep-named.mjs
 new file mode 100644
 index 0000000..0dbc408
@@ -110,10 +128,10 @@ index 0000000..0dbc408
 +}
 diff --git a/test/new/per-task-deadline.e6b18c.test.ts b/test/new/per-task-deadline.e6b18c.test.ts
 new file mode 100644
-index 0000000..5deda7e
+index 0000000..342da5f
 --- /dev/null
 +++ b/test/new/per-task-deadline.e6b18c.test.ts
-@@ -0,0 +1,653 @@
+@@ -0,0 +1,693 @@
 +import { fileURLToPath } from 'node:url'
 +import { MessageChannel } from 'node:worker_threads'
 +import { setTimeout as delay } from 'node:timers/promises'
@@ -124,6 +142,9 @@ index 0000000..5deda7e
 +const FIX = {
 +  hang: fileURLToPath(new URL('./fixtures/hang.mjs', import.meta.url)),
 +  sleep: fileURLToPath(new URL('./fixtures/sleep-named.mjs', import.meta.url)),
++  rejectAfter: fileURLToPath(
++    new URL('./fixtures/reject-after.mjs', import.meta.url)
++  ),
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -351,6 +372,22 @@ index 0000000..5deda7e
 +      /gracePeriod/
 +    )
 +  })
++
++  it('per-call Infinity/null taskTimeout and null gracePeriod are accepted', async () => {
++    // Pool default would deadline an 80ms task at 30ms; each per-call disable
++    // form must override it so the task completes without a breach.
++    const pool = makePool({ taskTimeout: 30 })
++    await expect(
++      pool.run({ time: 80, value: 'inf' }, { taskTimeout: Infinity })
++    ).resolves.toBe('inf')
++    await expect(
++      pool.run({ time: 80, value: 'nul' }, { taskTimeout: null as any })
++    ).resolves.toBe('nul')
++    await expect(
++      pool.run({ time: 80, value: 'g' }, { taskTimeout: 0, gracePeriod: null as any })
++    ).resolves.toBe('g')
++    expect(pool.taskTimeoutCount).toBe(0)
++  })
 +})
 +
 +describe('disable sentinels and defaults', () => {
@@ -509,6 +546,8 @@ index 0000000..5deda7e
 +      teardownAttempted: false,
 +      teardownCompleted: false,
 +    })
++    expect(typeof term?.payload.taskId).toBe('number')
++    expect(typeof term?.payload.workerId).toBe('number')
 +  })
 +
 +  it('events fire in order: timeout, grace, termination', async () => {
@@ -625,6 +664,25 @@ index 0000000..5deda7e
 +    await expect(pool.run({ time: 90, value: 'made-it' })).resolves.toBe(
 +      'made-it'
 +    )
++    expect(pool.taskTimeoutTerminationCount).toBe(0)
++  })
++
++  it('a task that rejects inside the grace window propagates its own error', async () => {
++    // Breaches at 40ms (grace runs to 340ms); the task throws on its own at
++    // ~90ms, inside the window, so the caller sees that error -- not a
++    // TaskTimeoutError -- and the worker is never hard-terminated.
++    const pool = track(
++      new Tinypool({
++        filename: FIX.rejectAfter,
++        minThreads: 1,
++        maxThreads: 1,
++        taskTimeout: 40,
++        gracePeriod: 300,
++      } as any)
++    )
++    const err = await rejection(pool.run({ time: 90 }))
++    expect(err.name).not.toBe('TaskTimeoutError')
++    expect(/rejected naturally/.test(err.message)).toBe(true)
 +    expect(pool.taskTimeoutTerminationCount).toBe(0)
 +  })
 +
