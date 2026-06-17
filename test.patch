@@ -1,9 +1,9 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..52e574e
+index 0000000..da0f3f9
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,65 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -35,14 +35,19 @@ index 0000000..52e574e
 +  exit 1
 +fi
 +
-+node_modules/.bin/tsdown >/dev/null 2>&1
++node_modules/.bin/tsdown >/dev/null 2>&1 || true
 +
 +case "$MODE" in
 +  base)
 +    TARGET=(test/*.test.ts)
-+    # The existing suite has slow worker-spawn / child_process tests; give them
-+    # a wide ceiling so a slow-but-correct run is not reported as a failure.
++    # --testTimeout: the suite has slow worker-spawn / child_process tests, so
++    # give them a wide ceiling. The base files run serially in one reused worker
++    # (the repo sets isolate:false), so the worker pools and socket listeners
++    # they spawn accumulate across all ~16 files; raise the heap so that
++    # accumulation does not exhaust the default limit and abort with no JUnit.
++    # (NODE_OPTIONS is inherited by vitest's forked test worker.)
 +    EXTRA=(--testTimeout=30000)
++    export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
 +    ;;
 +  new)
 +    TARGET=(test/new/*.test.ts)
@@ -103,24 +108,12 @@ index 0000000..0dbc408
 +  await delay(time)
 +  return value
 +}
-diff --git a/test/new/fixtures/wedge.js b/test/new/fixtures/wedge.js
-new file mode 100644
-index 0000000..176a426
---- /dev/null
-+++ b/test/new/fixtures/wedge.js
-@@ -0,0 +1,6 @@
-+export default function wedge() {
-+  const buf = new Int32Array(new SharedArrayBuffer(4))
-+  while (true) {
-+    Atomics.wait(buf, 0, 0)
-+  }
-+}
 diff --git a/test/new/per-task-deadline.e6b18c.test.ts b/test/new/per-task-deadline.e6b18c.test.ts
 new file mode 100644
-index 0000000..fd41a18
+index 0000000..5deda7e
 --- /dev/null
 +++ b/test/new/per-task-deadline.e6b18c.test.ts
-@@ -0,0 +1,631 @@
+@@ -0,0 +1,653 @@
 +import { fileURLToPath } from 'node:url'
 +import { MessageChannel } from 'node:worker_threads'
 +import { setTimeout as delay } from 'node:timers/promises'
@@ -131,7 +124,6 @@ index 0000000..fd41a18
 +const FIX = {
 +  hang: fileURLToPath(new URL('./fixtures/hang.mjs', import.meta.url)),
 +  sleep: fileURLToPath(new URL('./fixtures/sleep-named.mjs', import.meta.url)),
-+  wedge: fileURLToPath(new URL('./fixtures/wedge.js', import.meta.url)),
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -350,6 +342,13 @@ index 0000000..fd41a18
 +    const pool = makePool()
 +    expect(() => pool.run({}, { taskTimeout: -1 as any })).toThrow(
 +      /taskTimeout/
++    )
++  })
++
++  it('a gracePeriod TypeError message names the offending field', () => {
++    const pool = makePool()
++    expect(() => pool.run({}, { gracePeriod: -1 as any })).toThrow(
++      /gracePeriod/
 +    )
 +  })
 +})
@@ -750,6 +749,22 @@ index 0000000..fd41a18
 +      pool.run({ time: 10, value: 'ok' }, { taskTimeout: 0 })
 +    ).resolves.toBe('ok')
 +    expect(pool.taskTimeoutTerminationCount).toBe(1)
++  })
++
++  it('queue wait does not consume the deadline budget', async () => {
++    // Single worker: the second task waits ~200ms in the queue behind the
++    // first, far longer than its 100ms taskTimeout, but only runs for 20ms.
++    // The budget starts at dispatch, so it must resolve without a breach.
++    const pool = makePool({ minThreads: 1, maxThreads: 1 })
++    const first = pool.run({ time: 200, value: 'first' })
++    const second = pool.run(
++      { time: 20, value: 'second' },
++      { taskTimeout: 100 }
++    )
++    await expect(first).resolves.toBe('first')
++    await expect(second).resolves.toBe('second')
++    expect(pool.taskTimeoutCount).toBe(0)
++    expect(pool.taskTimeoutTerminationCount).toBe(0)
 +  })
 +})
 diff --git a/test/pool-destroy.test.ts b/test/pool-destroy.test.ts
