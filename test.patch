@@ -1,9 +1,9 @@
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..dcca46b
+index 0000000..732c0cd
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,64 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -40,17 +40,13 @@ index 0000000..dcca46b
 +case "$MODE" in
 +  base)
 +    TARGET=(test/*.test.ts)
-+    # --testTimeout: the suite has slow worker-spawn / child_process tests, so
-+    # give them a wide ceiling.
-+    # --isolate: the repo sets isolate:false, so all ~16 base files would share
-+    # one reused test worker and the tinypool pools / socket listeners they spawn
-+    # accumulate across the whole run, exhausting the heap and aborting with no
-+    # JUnit. Isolating gives each file a fresh process so memory is reclaimed
-+    # between files; this caps accumulation regardless of total size. Kept
-+    # serial (--no-file-parallelism) so the fresh processes start one at a time.
-+    # The heap bump is belt-and-suspenders headroom for any single slow file.
++    # --testTimeout=30000: the suite has slow worker-spawn / child_process tests.
++    # --isolate: the repo's vitest.config sets isolate:false, so all ~16 base
++    # files share one reused worker and the tinypool pools they spawn accumulate
++    # until the heap exhausts (base-after-solution OOM'd with no JUnit). A fresh
++    # process per file reclaims memory between files (verified: base passes under
++    # a 512MB heap with --isolate, vs OOM without).
 +    EXTRA=(--testTimeout=30000 --isolate)
-+    export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
 +    ;;
 +  new)
 +    TARGET=(test/new/*.test.ts)
